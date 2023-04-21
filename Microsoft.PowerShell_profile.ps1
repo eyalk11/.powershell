@@ -20,7 +20,9 @@ set-alias cd   MyCD
 
 function StupidHist
 {
-    Get-Content $HOME\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadline\ConsoleHost_history.txt | select-string -Pattern "^cd c:"  | %{ echo ($_ -replace "^cd (.*)","`$1")   } | Sort-Object -Unique | Where-Object { Test-Path $_ }
+    #History of all saved commands
+    $histloc = $(Get-PSReadLineOption).HistorySavePath
+    Get-Content  $histloc | select-string -Pattern "^cd c:"  | %{ echo ($_ -replace "^cd (.*)","`$1")   } | Sort-Object -Unique | Where-Object { Test-Path $_ }
 }
 function CdLast
 {
