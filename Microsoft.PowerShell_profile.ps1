@@ -1,6 +1,54 @@
 #Write-Host "started"
 using namespace System.Management.Automation
-    New-Alias z Get-Help -ErrorAction SilentlyContinue
+New-Alias z Get-Help -ErrorAction SilentlyContinue
+remove-alias cd
+function MyCD
+{
+    Set-Location   @args
+        $dict = @{
+            Id = "30"
+             CommandLine = "cd $(Get-Location)"
+             ExecutionStatus = "Completed"
+             StartExecutionTime = $(Get-Date -Format "yyyy-MM-dd HH:mm:ss" )
+             EndExecutionTime = $(Get-Date -Format "yyyy-MM-dd HH:mm:ss" )
+             Duration = "00:00:00.0389011"
+                 }
+        $xx=New-Object -TypeName PSObject -Property $dict
+        Add-History -InputObject $xx
+}
+set-alias cd   MyCD
+
+function StupidHist
+{
+    Get-Content $HOME\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadline\ConsoleHost_history.txt | select-string -Pattern "^cd c:"  | %{ echo ($_ -replace "^cd (.*)","`$1")   } | Sort-Object -Unique | Where-Object { Test-Path $_ }
+}
+function CdLast
+{
+    $loc= StupidHist | FZF
+    if($loc)
+    {
+        Set-Location $loc
+    }
+}
+set-alias q CdLast
+function ConVM
+{
+$Username = "User"
+$Password = ConvertTo-SecureString "Password1" -AsPlainText -Force
+$Credential = New-Object System.Management.Automation.PSCredential($Username, $Password)
+$Session = New-PSSession -VMName win10 -Credential $Credential
+return $Session 
+}
+
+function ClearShada
+{
+    rm C:\Users\ekarni\AppData\Local\nvim-data\shada\*
+    ResetNeo
+}
+function Which($arg)
+{
+    python -c "import shutil; print(shutil.which('$arg'))"
+}
 function AddWrapper([parameter(mandatory=$true, position=0)][string]$For,[parameter(mandatory=$true, position=1)][string]$To) 
 {
     $paramDictionary = [RuntimeDefinedParameterDictionary]::new()
@@ -106,7 +154,10 @@ function RunBash($fil)
 {
 wsl bash -c "source /home/ekarni/.bash_profile; $fil" 
 }
-
+function OtherPython($a)
+{
+    Invoke-expression "C:\users\ekarni\AppData\Local\Programs\Python\Python39\python.exe $a"
+}
 function Show-Window {
   param(
     [Parameter(Mandatory)]
@@ -147,3 +198,49 @@ function Show-Window {
   }
 
 }
+Function Get-LockingProcess {
+
+[cmdletbinding()]
+Param(
+    [Parameter(Position=0, Mandatory=$True,
+    HelpMessage="What is the path or filename? You can enter a partial name without wildcards")]
+    [Alias("name")]
+    [ValidateNotNullorEmpty()]
+    [string]$Path
+)
+
+# Define the path to Handle.exe
+# //$Handle = "G:\Sysinternals\handle.exe"
+$Handle = "C:\SysinternalsSuite\handle.exe"
+
+# //[regex]$matchPattern = "(?<Name>\w+\.\w+)\s+pid:\s+(?<PID>\b(\d+)\b)\s+type:\s+(?<Type>\w+)\s+\w+:\s+(?<Path>.*)"
+# //[regex]$matchPattern = "(?<Name>\w+\.\w+)\s+pid:\s+(?<PID>\d+)\s+type:\s+(?<Type>\w+)\s+\w+:\s+(?<Path>.*)"
+# (?m) for multiline matching.
+# It must be . (not \.) for user group.
+[regex]$matchPattern = "(?m)^(?<Name>\w+\.\w+)\s+pid:\s+(?<PID>\d+)\s+type:\s+(?<Type>\w+)\s+(?<User>.+)\s+\w+:\s+(?<Path>.*)$"
+
+# skip processing banner
+$data = &$handle -u $path -nobanner
+# join output for multi-line matching
+$data = $data -join "`n"
+$MyMatches = $matchPattern.Matches( $data )
+
+# //if ($MyMatches.value) {
+if ($MyMatches.count) {
+
+    $MyMatches | foreach {
+        [pscustomobject]@{
+            FullName = $_.groups["Name"].value
+            Name = $_.groups["Name"].value.split(".")[0]
+            ID = $_.groups["PID"].value
+            Type = $_.groups["Type"].value
+            User = $_.groups["User"].value.trim()
+            Path = $_.groups["Path"].value
+            toString = "pid: $($_.groups["PID"].value), user: $($_.groups["User"].value), image: $($_.groups["Name"].value)"
+        } #hashtable
+    } #foreach
+} #if data
+else {
+    Write-Warning "No matching handles found"
+}
+} #end function
