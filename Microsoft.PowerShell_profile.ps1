@@ -1,38 +1,58 @@
-#Write-Host "started"
-using namespace System.Management.Automation
-New-Alias z Get-Help -ErrorAction SilentlyContinue
-remove-alias cd
-function MyCD
-{
-    Set-Location   @args
-        $dict = @{
-            Id = "30"
-             CommandLine = "cd $(Get-Location)"
-             ExecutionStatus = "Completed"
-             StartExecutionTime = $(Get-Date -Format "yyyy-MM-dd HH:mm:ss" )
-             EndExecutionTime = $(Get-Date -Format "yyyy-MM-dd HH:mm:ss" )
-             Duration = "00:00:00.0389011"
-                 }
-        $xx=New-Object -TypeName PSObject -Property $dict
-        Add-History -InputObject $xx
-}
-set-alias cd   MyCD
 
-function StupidHist
-{
-    #History of all saved commands
-    $histloc = $(Get-PSReadLineOption).HistorySavePath
-    Get-Content  $histloc | select-string -Pattern "^cd c:"  | %{ echo ($_ -replace "^cd (.*)","`$1")   } | Sort-Object -Unique | Where-Object { Test-Path $_ }
+using namespace System.Management.Automation
+Add-Type -AssemblyName System.Windows.Forms
+
+. $PSScriptRoot\secret.ps1
+#Write-Host "started"
+
+New-Alias z Get-Help -ErrorAction SilentlyContinue
+# Remove the default cd alias
+Remove-Alias cd
+# Create a new cd function
+function MyCD {
+    Set-Location @args
+    $curtime =$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+    $dict = @{
+        Id = "30"
+        CommandLine = "cd $(Get-Location)"
+        ExecutionStatus = "Completed"
+        StartExecutionTime = $curtime
+        EndExecutionTime = $curtime
+        Duration = "00:00:00.0389011"
+    }
+    $historyObject = New-Object -TypeName PSObject -Property $dict
+    Add-History -InputObject $historyObject
 }
-function CdLast
+# Set cd to use the new function
+Set-Alias cd MyCD
+function SimpHistEx
 {
-    $loc= StupidHist | FZF
-    if($loc)
-    {
-        Set-Location $loc
+     $va=$(SimpHist)
+     [System.Windows.Forms.SendKeys]::SendWait($va)
+
+
+}
+function SimpHist 
+{
+    $historyLocation = $(Get-PSReadLineOption).HistorySavePath
+    $all = Get-Content $historyLocation
+    return $($all | Sort-Object -Unique | FZF)
+}
+# Function to get history of saved locations
+function StupidHist {
+ $historyLocation = $(Get-PSReadLineOption).HistorySavePath
+ $all = Get-Content $historyLocation | select-string -Pattern "^cd .:" | %{ echo ($_ -replace "^cd (.*)","`$1") } | Sort-Object -Unique 
+ return $all | Where-Object { Test-Path $($_) }
+}
+# Function to change to the last visited location
+function CdLast {
+    $location = StupidHist | FZF
+    if ($location) {
+        Set-Location $location
     }
 }
-set-alias q CdLast
+# Create an alias for CdLast
+Set-Alias q CdLast
 function ConVM
 {
 $Username = "User"
@@ -246,3 +266,66 @@ else {
     Write-Warning "No matching handles found"
 }
 } #end function
+function copy-foldertovirtualmachine {
+    param(
+            [parameter (mandatory = $true, valuefrompipeline = $true)]
+            [string]$VMName,
+            [string]$FromFolder = '.\'
+         )
+        foreach ($File in (Get-ChildItem $Folder -recurse | ? Mode -ne 'd-----')){
+
+              $relativePath = $item.FullName.Substring($Root.Length)
+            Copy-VMFile -VM (Get-VM $VMName) -SourcePath $file.fullname -DestinationPath $file.fullname -FileSource Host -CreateFullPath -Force}
+}
+
+function NewVMDrive
+{
+$Username = "user"
+$Password = ConvertTo-SecureString "Password1" -AsPlainText -Force
+$Credential = New-Object System.Management.Automation.PSCredential($Username, $Password)
+New-PSDrive -Name "V" -PSProvider "FileSystem" -Root "\\192.168.10.2\c$" -Credential $cred -Persist 
+}
+function GetGitStash
+{
+     git stash list | ss mychanges | %{ $_ -replace ":.*$"} | %{ git diff $_^1 $_}
+}
+function SquashCommits([int]$count) {
+$commitHashes = git log --pretty=format:%h -n $count    
+
+$commands= ( 0..$($count-2) ) |  %{   "sed -i 's/^pick $($commitHashes[$_])/squash $($commitHashes[$_])/' `$file"    }
+$st= $commands -join "`n"
+
+$st="func() { 
+local file=`$1
+$st 
+}; func"
+$env:GIT_SEQUENCE_EDITOR=$st
+try{
+        git rebase -i HEAD~$count
+    }finally
+    {
+        Remove-Item Env:\GIT_SEQUENCE_EDITOR
+    }
+}
+
+function RemoveCommit([string]$commit) {
+$commitid=git log --pretty="%h" --grep=$commit
+
+
+$st= "sed -i 's/^pick $($commitid)/drop $($commitid)/' `$file"
+$st= $commands -join "`n"
+
+$st="func() {
+local file=`$1
+$st
+}; func"
+$env:GIT_SEQUENCE_EDITOR=$st
+try{
+        git rebase -i HEAD~$count
+    }finally
+    {
+        Remove-Item Env:\GIT_SEQUENCE_EDITOR
+    }
+}
+
+
