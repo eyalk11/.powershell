@@ -1,27 +1,147 @@
 
 using namespace System.Management.Automation
 Add-Type -AssemblyName System.Windows.Forms
-
+#Set-PSReadlineOption -AddToHistoryHandler
 . $PSScriptRoot\secret.ps1
 #Write-Host "started"
-
+New-Alias ss Select-String
+New-Alias grep Select-String
 New-Alias z Get-Help -ErrorAction SilentlyContinue
+New-Alias m Get-Member
 # Remove the default cd alias
 Remove-Alias cd
 # Create a new cd function
+#
+#
+function ConvertPSObjectToHashtable
+{
+    param (
+        [Parameter(ValueFromPipeline)]
+        $InputObject
+    )
+
+    process
+    {
+        if ($null -eq $InputObject) { return $null }
+
+        if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string])
+        {
+            $collection = @(
+                foreach ($object in $InputObject) { ConvertPSObjectToHashtable $object }
+            )
+
+            Write-Output -NoEnumerate $collection
+        }
+        elseif ($InputObject -is [psobject])
+        {
+            $hash = @{}
+
+            foreach ($property in $InputObject.PSObject.Properties)
+            {
+                $hash[$property.Name] = (ConvertPSObjectToHashtable $property.Value).PSObject.BaseObject
+            }
+
+            $hash
+        }
+        else
+        {
+            $InputObject
+        }
+    }
+}
+$ExecutionContext.InvokeCommand.PostCommandLookupAction = {
+#if ($global:_preExecHandled) { return }
+$cmdLine = $MyInvocation.Line
+if ($args[1].CommandOrigin -ne 'Runspace' -or $cmdLine -match 'PostCommandLookupAction|^prompt$') { return }
+#$global:_preExecHandled = $true; $global:_prevTitle = $host.UI.RawUI.WindowTitle
+#$info = "Submitting at $(Get-Date): $cmdLine"
+#Write-Host -Foreground Yellow $info
+#$host.UI.RawUI.WindowTitle = $info
+}
+
+#$function:prompt = "$function:prompt; `$global:_preExecHandled = `$false; if (`$global:_prevTitle) { `$host.UI.RawUI.WindowTitle = `$global:_prevTitle }"
+
+#$global:jsonFile = Join-Path -Path $env:USERPROFILE -ChildPath ('cmdLines_{0}.json' -f (Get-Date -Format 'yyyyMMddHHmmss'))
+$global:jsonFile = Join-Path -Path $env:USERPROFILE -ChildPath ('cmdLines.json' )
+
+$ExecutionContext.InvokeCommand.PostCommandLookupAction = {
+    $cmdLine = $MyInvocation.Line
+    if ($args[1].CommandOrigin -ne 'Runspace' -or $cmdLine -match 'PostCommandLookupAction|^prompt$') { return }
+
+    $currentDir = (Get-Location).Path
+
+    if (!(Test-Path -Path $global:jsonFile)) {
+        @{ $currentDir = @($cmdLine) } | ConvertTo-Json | Set-Content -Path $global:jsonFile
+    } else {
+        $existingCmdLines = Get-Content -Path $global:jsonFile | ConvertFrom-Json 
+        $existingCmdLines = ConvertPSObjectToHashtable $existingCmdLines
+
+        if (!$existingCmdLines.ContainsKey($currentDir)) {
+            $existingCmdLines.Add($currentDir, @($cmdLine))
+        } else {
+            if (!$existingCmdLines[$currentDir].Contains($cmdLine)) {
+                $existingCmdLines[$currentDir] += $cmdLine
+            }
+        }
+        $existingCmdLines | ConvertTo-Json | Set-Content -Path $global:jsonFile
+    }
+}
+$parameters = @{
+    Key = 'Alt+f'
+        BriefDescription = 'Go to last dir'
+        LongDescription = 'Go to last dir'
+        ScriptBlock = {
+            param($key, $arg)   # The arguments are ignored in this example
+               CdLast 
+        }
+}
+Set-PSReadLineKeyHandler @parameters
+$parameters = @{
+    Key = 'Alt+e'
+        BriefDescription = 'Execute from last same direrctory'
+        LongDescription = 'Execute from last commands typed in same direrctory'
+        ScriptBlock = {
+            param($key, $arg)   # The arguments are ignored in this example
+                [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
+                [Microsoft.PowerShell.PSConsoleReadLine]::Insert( $(GrepOnCurDir) )
+                    [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+
+        }
+}
+Set-PSReadLineKeyHandler @parameters
+$parameters = @{
+Key = 'Alt+l'
+BriefDescription = 'Grep from last same direrctory'
+LongDescription = 'Grep from last commands typed in same direrctory'
+ScriptBlock = {
+  param($key, $arg)   # The arguments are ignored in this example
+  [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
+        [Microsoft.PowerShell.PSConsoleReadLine]::Insert( $(GrepOnCurDir) )
+}
+}
+Set-PSReadLineKeyHandler @parameters
+function GrepOnCurDir()
+{
+    $currentDir = (Get-Location).Path
+    $existingCmdLines = Get-Content -Path $global:jsonFile | ConvertFrom-Json 
+    $existingCmdLines = ConvertPSObjectToHashtable $existingCmdLines
+    $existingCmdLines[$currentDir] | fzf
+}
 function MyCD {
     Set-Location @args
-    $curtime =$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-    $dict = @{
-        Id = "30"
-        CommandLine = "cd $(Get-Location)"
-        ExecutionStatus = "Completed"
-        StartExecutionTime = $curtime
-        EndExecutionTime = $curtime
-        Duration = "00:00:00.0389011"
-    }
-    $historyObject = New-Object -TypeName PSObject -Property $dict
-    Add-History -InputObject $historyObject
+    #$curtime =$(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+    #$dict = @{
+        #Id = "30"
+        #CommandLine = "cd $(Get-Location)"
+        #ExecutionStatus = "Completed"
+        #StartExecutionTime = $curtime
+        #EndExecutionTime = $curtime
+        #Duration = "00:00:00.0389011"
+    #}
+    #$historyObject = New-Object -TypeName PSObject -Property $dict
+    #Add-History -InputObject $historyObject
+    $historyLocation = $(Get-PSReadLineOption).HistorySavePath
+    Add-Content -Path $historyLocation -Value "cd $(Get-Location)"
 }
 # Set cd to use the new function
 Set-Alias cd MyCD
@@ -134,7 +254,7 @@ Write-Host "optb",$OptionB
 }
 Function Term($Proc,$cmd)
 {
-(Get-Process -Name $Proc) | Where-Object CommandLine -like $cmd | %{Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ($_.Id)) } | %{ Invoke-CimMethod -InputObject $_ -MethodName Terminate }
+(Get-Process -Name $Proc) | Where-Object CommandLine -like $cmd | ForEach-Object{Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ($_.Id)) } | %{ Invoke-CimMethod -InputObject $_ -MethodName Terminate }
 }
 
 Function KillAllPyCharm()
@@ -289,6 +409,11 @@ function GetGitStash
 {
      git stash list | ss mychanges | %{ $_ -replace ":.*$"} | %{ git diff $_^1 $_}
 }
+function  CheckCommit ($n,$line)
+{
+$commits= git log --pretty=format:%h -n $n
+$commits | %{ git show $_ | select-string $line} 
+}
 function SquashCommits([int]$count) {
 $commitHashes = git log --pretty=format:%h -n $count    
 
@@ -327,5 +452,32 @@ try{
         Remove-Item Env:\GIT_SEQUENCE_EDITOR
     }
 }
+function ExtractFromLastStash($file) {
+    $x=git diff stash@`{0`}^1 stash@`{0`} -- $file 
+    return $x
+}
 
 
+function RestartWsl()
+{
+    Get-Service LxssManager | Restart-Service
+
+}
+function UpdateVim($typ)
+{
+    cd C:\Users\ekarni
+    Write-Host "usage: new-version-zip-filename (ie nightly)"
+    Remove-Item -Path nvim-win64.zip -ErrorAction SilentlyContinue
+    $webClient = New-Object System.Net.WebClient
+    $webClient.DownloadFile("https://github.com/neovim/neovim/releases/download/$typ/nvim-win64.zip", "C:\Users\ekarni\nvim-win64.zip")
+    if (Test-Path -Path nvim-temp) {
+        Write-Host "moving temp to last temp"
+            Remove-Item -Path ./neovim-lasttemp -Recurse -Force -ErrorAction SilentlyContinue
+            Move-Item -Path nvim-temp -Destination nvim-lasttemp
+    }
+    #Move-Item -Path nvim-temp -Destination nvim-lasttemp     -ErrorAction SilentlyContinue
+    Move-Item -Path ./Neovim -Destination nvim-temp
+    Expand-Archive -Path nvim-win64.zip -DestinationPath ./Neovim -Force
+
+
+}
