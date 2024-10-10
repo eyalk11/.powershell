@@ -2,6 +2,7 @@
 using namespace System.Management.Automation
 Add-Type -AssemblyName System.Windows.Forms
 #Set-PSReadlineOption -AddToHistoryHandler
+#  $x | where { $y=cat $_ | ss  -Pattern "\bcall" | ss "\bput" ; $y.Length -ge 1 }
 . $PSScriptRoot\secret.ps1
 #Write-Host "started"
 New-Alias ss Select-String
@@ -49,19 +50,7 @@ function ConvertPSObjectToHashtable
         }
     }
 }
-$ExecutionContext.InvokeCommand.PostCommandLookupAction = {
-#if ($global:_preExecHandled) { return }
-$cmdLine = $MyInvocation.Line
-if ($args[1].CommandOrigin -ne 'Runspace' -or $cmdLine -match 'PostCommandLookupAction|^prompt$') { return }
-#$global:_preExecHandled = $true; $global:_prevTitle = $host.UI.RawUI.WindowTitle
-#$info = "Submitting at $(Get-Date): $cmdLine"
-#Write-Host -Foreground Yellow $info
-#$host.UI.RawUI.WindowTitle = $info
-}
 
-#$function:prompt = "$function:prompt; `$global:_preExecHandled = `$false; if (`$global:_prevTitle) { `$host.UI.RawUI.WindowTitle = `$global:_prevTitle }"
-
-#$global:jsonFile = Join-Path -Path $env:USERPROFILE -ChildPath ('cmdLines_{0}.json' -f (Get-Date -Format 'yyyyMMddHHmmss'))
 $global:jsonFile = Join-Path -Path $env:USERPROFILE -ChildPath ('cmdLines.json' )
 
 $ExecutionContext.InvokeCommand.PostCommandLookupAction = {
@@ -87,7 +76,7 @@ $ExecutionContext.InvokeCommand.PostCommandLookupAction = {
     }
 }
 $parameters = @{
-    Key = 'Alt+f'
+    Key = 'Alt+q'
         BriefDescription = 'Go to last dir'
         LongDescription = 'Go to last dir'
         ScriptBlock = {
@@ -147,8 +136,12 @@ function MyCD {
 Set-Alias cd MyCD
 function SimpHistEx
 {
-     $va=$(SimpHist)
-     [System.Windows.Forms.SendKeys]::SendWait($va)
+    $va=$(SimpHist)
+    [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
+        [Microsoft.PowerShell.PSConsoleReadLine]::Insert( $va )
+        [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+
+     #[System.Windows.Forms.SendKeys]::SendWait($va)
 
 
 }
@@ -457,6 +450,42 @@ function ExtractFromLastStash($file) {
     return $x
 }
 
+function GitPullKeepLocal () {
+param ( 
+[parameter()][switch]$keeplocalinconflict =$false) 
+
+    $commit_hash=$(git rev-parse HEAD)
+    git stash save | Out-Null
+    git pull --rebase 
+    $conflicts = $(git diff --name-only --diff-filter=U)
+    $changes = $(git diff --name-only $commit_hash)
+    if ($conflicts) {
+        Write-Host "There are merge conflicts. Please run git pull. Aborting"
+        #abort the pull
+        git rebase --abort
+        
+
+        # Exit or throw an error here, if you want to stop the script
+    } else {
+
+        # Checkout files from the stash
+        git checkout stash -- . | Out-Null
+        git reset | Out-Null
+        $localch= $(git diff --name-only)
+        $int = $localch | ?{ $changes -contains $_  } 
+        if ($int) {
+            echo "Following files are in both: $int " 
+        }
+        if ($int -and $(-not ($keeplocalinconflict)))
+        {
+            echo "reseting to remote"
+            git checkout -- $int
+        }
+        # Drop the stash
+    }
+    
+
+}
 
 function RestartWsl()
 {
@@ -481,3 +510,5 @@ function UpdateVim($typ)
 
 
 }
+
+New-Alias gitp GitPullKeepLocal
