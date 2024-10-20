@@ -14,6 +14,42 @@ Remove-Alias cd
 # Create a new cd function
 #
 #
+function Checkout-FileWithDifferentName {
+    param (
+        [string]$FilePath,
+        [string]$NewFileName,
+        [string]$Branch = "main"
+    )
+    # Check if the file exists in the current directory
+    if (-Not (Test-Path $FilePath)) {
+        Write-Error "File '$FilePath' does not exist in the current directory."
+        return
+    }
+    # Get the directory and file name from the file path
+    $directory = Split-Path $FilePath
+    $fileName = Split-Path $FilePath -Leaf
+    # Change to the directory containing the file
+    Push-Location $directory
+    try {
+        # Stash any local changes to the file
+        git stash push $fileName
+        # Checkout the file from the specified branch
+        git checkout $Branch -- $fileName
+        # Rename the checked-out file
+        Rename-Item -Path $fileName -NewName $NewFileName
+        # Restore the stashed changes
+        git stash pop
+    }
+    catch {
+        Write-Error "An error occurred: $_"
+    }
+    finally {
+        # Return to the original directory
+        Pop-Location
+    }
+}
+
+
 function ConvertPSObjectToHashtable
 {
     param (
@@ -265,9 +301,9 @@ function Get
     Write-Host "opta",$OptionA
     Write-Host "optb",$OptionB
 }
-Function Term($Proc,$cmd)
+Function Term($Proc,$cmd="*")
 {
-(Get-Process -Name $Proc) | Where-Object CommandLine -like $cmd | ForEach-Object{Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ($_.Id)) } | %{ Invoke-CimMethod -InputObject $_ -MethodName Terminate }
+(Get-Process) | Where { $_.name -like $Proc}    | Where-Object CommandLine -like $cmd | ForEach-Object{Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f ($_.Id)) } | %{ Invoke-CimMethod -InputObject $_ -MethodName Terminate }
 }
 
 Function KillAllPyCharm()
@@ -489,6 +525,43 @@ function ExtractFromLastStash($file)
     return $x
 }
 
+function Checkout-FileFromStash {
+    param (
+        [Parameter(Mandatory = $true)]
+        [string]$FilePath,
+        [Parameter(Mandatory = $false)]
+        [int]$StashIndex
+    )
+    # Get the list of stashes
+    $stashes = git stash list
+    if ($stashes.Count -eq 0) {
+        Write-Host "No stashes found."
+        return
+    }
+    # Display the list of stashes
+    Write-Host "Available stashes:"
+    $stashes | ForEach-Object { Write-Host $_ }
+    # If StashIndex is not provided, prompt the user to select a stash
+    if (-not $PSBoundParameters.ContainsKey('StashIndex')) {
+        $StashIndex = Read-Host "Enter the index of the stash you want to use (e.g., 0 for stash@{0})"
+        # Validate the user's input
+        if (-not $StashIndex -match '^\d+$') {
+            Write-Error "Invalid input. Please enter a valid stash index."
+            return
+        }
+    }
+    # Checkout the specified file from the selected stash
+    try {
+        git checkout stash@{$StashIndex} -- $FilePath
+        Write-Host "File '$FilePath' has been checked out from stash@{$StashIndex}."
+    } catch {
+        Write-Error "An error occurred while checking out the file: $_"
+    }
+}
+function StashAll($name)
+{
+    git stash store $(git stash create) -m $name
+}
 function GitPullKeepLocal ()
 {
     param ( 
