@@ -7,12 +7,11 @@
 #  $x | where { $y=cat $_ | ss  -Pattern "\bcall" | ss "\bput" ; $y.Length -ge 1 }
 #Write-Host "started"
 New-Alias ss Select-String
-New-Alias grep Select-String
 New-Alias z Get-Help -ErrorAction SilentlyContinue
 New-Alias m Get-Member
 New-Alias P pwsh
+New-Alias gitp GitPullKeepLocal
 # Remove the default cd alias
-$qtpath="C:\Program Files\neovim-qt 0.2.19\bin\nvim-qt.exe"
 # Create a new cd function
 #
 #
@@ -440,29 +439,6 @@ Optional line number to jump to.
 }
 
 
-Function ResetNeo($a)
-{
-<#
-.SYNOPSIS
-Restarts neovim-qt, optionally opening a file.
-.DESCRIPTION
-Kills all running nvim-qt and nvim processes, then starts a fresh nvim-qt instance. If a file path is provided it is passed as an argument to nvim-qt.
-.PARAMETER a
-Optional file or argument to pass to nvim-qt on startup.
-#>
-    #DelProcess nvim-qt
-    Term nvim-qt
-    Term nvim
-    if ($a)
-    {
-        Start-Process $qtpath -ArgumentList ($a)
-    } else
-    { Start-Process $qtpath
-    }
-
-    #ps | Where-Object -Property ProcessName  -Like "*goneovim*"| %{Write-Host $_.Id ,$_.ProcessName ;$_.Kill()}
-    #C:\Users\ekarni\Downloads\Goneovim-v0.4.12-win64\goneovim.exe
-}
 
 Function DelProcess($name)
 {
@@ -867,7 +843,7 @@ The directory path to append to PATH. No-op if already present.
     )
     # Check if the path already exists in the PATH variable
     $currentPath = [System.Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::Machine)
-    if ($currentPath -like "*$PathToAdd*") {
+    if ($currentPath -like "*$PathToAdd;*") {
         Write-Host "The path '$PathToAdd' is already in the system PATH."
         return
     }
@@ -877,7 +853,6 @@ The directory path to append to PATH. No-op if already present.
     [System.Environment]::SetEnvironmentVariable("Path", $newPath, [System.EnvironmentVariableTarget]::Machine)
     Write-Host "The path '$PathToAdd' has been added to the system PATH."
 }
-New-Alias gitp GitPullKeepLocal
 function FindGitFile ($x)
 {
 <#
@@ -1983,4 +1958,249 @@ function CloseClaudeDesktop() {
 Closes the Claude desktop app (WindowsApps package).
 #>
     Get-process Claude | where {$_.Path -like "*WindowsApp*" }  | %{ echo $_ } | Stop-Process
-    } 
+    }
+
+function New-TrayIcon {
+<#
+.SYNOPSIS
+Creates a system tray icon with a configurable context menu.
+.DESCRIPTION
+Creates a Windows system tray (NotifyIcon) with a right-click context menu.
+Each menu item can run a configurable command (scriptblock or string).
+Runs the message loop in a STA runspace so the calling shell stays interactive.
+Returns a hashtable with 'Runspace' and 'PowerShell' so callers can dispose/stop it.
+.PARAMETER Tooltip
+Text shown when hovering over the tray icon.
+.PARAMETER MenuItems
+Array of [PSCustomObject]@{Label='...'; Command={...}} entries.
+Each Command can be a ScriptBlock or a string (passed to Invoke-Expression).
+.PARAMETER IconPath
+Optional path to a .ico file. Defaults to the PowerShell icon.
+.PARAMETER HotKey
+Optional global keyboard shortcut to open the menu (e.g., 'Win+Alt+T', 'Ctrl+Shift+M').
+Supported modifiers: Win, Ctrl, Alt, Shift. Example: 'Ctrl+Alt+T'
+.EXAMPLE
+$items = @(
+    [PSCustomObject]@{ Label = 'Run Notebook'; Command = { jupyter nbconvert --to notebook --execute mynotebook.ipynb } }
+    [PSCustomObject]@{ Label = 'Open Shell';   Command = 'pwsh' }
+)
+$tray = New-TrayIcon -Tooltip 'My App' -MenuItems $items -HotKey 'Ctrl+Alt+T'
+# To remove it later:
+# $tray.PowerShell.Stop(); $tray.Runspace.Dispose()
+#>
+    param(
+        [string]$Tooltip = 'PowerShell Tray',
+        [Parameter(Mandatory)]
+        [object[]]$MenuItems,
+        [string]$IconPath = '',
+        [string]$HotKey = ''
+    )
+    $mutexName = 'Global\PSTrayIcon_Mutex'
+    $mutex = [System.Threading.Mutex]::new($false, $mutexName)
+    $acquired = $mutex.WaitOne(0)   # non-blocking try
+    if (-not $acquired) {
+        Write-Warning "Tray icon is already running in another process."
+            $mutex.Dispose()
+            return
+    }
+if ($global:tray) {
+    $global:tray.Dispose()
+        $global:tray = $null
+}
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $runspace.ApartmentState = [System.Threading.ApartmentState]::STA
+    $runspace.ThreadOptions   = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+    $runspace.Open()
+
+    $runspace.SessionStateProxy.SetVariable('TrayTooltip',  $Tooltip)
+    $runspace.SessionStateProxy.SetVariable('TrayMenuItems', $MenuItems)
+    $runspace.SessionStateProxy.SetVariable('TrayIconPath',  $IconPath)
+    $runspace.SessionStateProxy.SetVariable('TrayHotKey',    $HotKey)
+
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $runspace
+
+    $null = $ps.AddScript({
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+
+        # Register global hotkey API
+        if ($TrayHotKey) {
+            $HotKeyCode = @"
+using System;
+using System.Runtime.InteropServices;
+public static class HotKeyHelper {
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    [DllImport("user32.dll")]
+    public static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
+    public const uint MOD_CONTROL = 0x0002;
+    public const uint MOD_ALT = 0x0001;
+    public const uint MOD_SHIFT = 0x0004;
+    public const uint MOD_WIN = 0x0008;
+}
+"@
+            Add-Type -TypeDefinition $HotKeyCode -ErrorAction SilentlyContinue
+        }
+
+        if ($TrayIconPath -and (Test-Path $TrayIconPath)) {
+            $icon = [System.Drawing.Icon]::new($TrayIconPath)
+        } else {
+            $psExe = (Get-Process -Id $PID).Path
+            $icon  = [System.Drawing.Icon]::ExtractAssociatedIcon($psExe)
+        }
+
+        $notifyIcon         = [System.Windows.Forms.NotifyIcon]::new()
+        $notifyIcon.Icon    = $icon
+        $notifyIcon.Text    = $TrayTooltip
+        $notifyIcon.Visible = $true
+
+        $menu = [System.Windows.Forms.ContextMenuStrip]::new()
+
+        foreach ($item in $TrayMenuItems) {
+            $menuItem = [System.Windows.Forms.ToolStripMenuItem]::new($item.Label)
+            $cmd = $item.Command
+            $menuItem.add_Click({
+                if ($cmd -is [scriptblock]) {
+                    & $cmd
+                } else {
+                    Invoke-Expression ([string]$cmd)
+                }
+            }.GetNewClosure())
+            $null = $menu.Items.Add($menuItem)
+        }
+
+        $null = $menu.Items.Add([System.Windows.Forms.ToolStripSeparator]::new())
+
+        $exitItem = [System.Windows.Forms.ToolStripMenuItem]::new('Exit')
+        $exitItem.add_Click({
+            $notifyIcon.Visible = $false
+            $notifyIcon.Dispose()
+            [System.Windows.Forms.Application]::Exit()
+        })
+        $null = $menu.Items.Add($exitItem)
+
+        $notifyIcon.ContextMenuStrip = $menu
+
+        # Setup hotkey if provided
+        if ($TrayHotKey) {
+            $hiddenForm = New-Object System.Windows.Forms.Form
+            $hiddenForm.ShowInTaskbar = $false
+            $hiddenForm.WindowState = 'Minimized'
+            $hiddenForm.FormBorderStyle = 'None'
+            $hiddenForm.Size = @{ Width = 1; Height = 1 }
+
+            # Parse hotkey string (e.g., "Ctrl+Alt+T")
+            $hotKeyParts = $TrayHotKey -split '\+'
+            $modifiers = 0
+            $vk = 0
+
+            foreach ($part in $hotKeyParts) {
+                $part = $part.Trim()
+                switch -Exact ($part) {
+                    'Ctrl'  { $modifiers += [HotKeyHelper]::MOD_CONTROL }
+                    'Alt'   { $modifiers += [HotKeyHelper]::MOD_ALT }
+                    'Shift' { $modifiers += [HotKeyHelper]::MOD_SHIFT }
+                    'Win'   { $modifiers += [HotKeyHelper]::MOD_WIN }
+                    default {
+                        # Parse key name to virtual key code
+                        if ($part.Length -eq 1) {
+                            $vk = [System.Windows.Forms.Keys]::($part.ToUpper())
+                        } else {
+                            $vk = [System.Windows.Forms.Keys]::$part
+                        }
+                    }
+                }
+            }
+
+            $hotKeyId = 9999
+            $registered = [HotKeyHelper]::RegisterHotKey($hiddenForm.Handle, $hotKeyId, $modifiers, $vk)
+
+            if ($registered) {
+                $hiddenForm.add_Load({
+                    $form = $this
+                    $form.add_FormClosing({ [HotKeyHelper]::UnregisterHotKey($form.Handle, $hotKeyId) })
+                })
+
+                # Override WndProc to capture WM_HOTKEY
+                $form = $hiddenForm
+                $originalWndProc = $form.WndProc
+                $form.WndProc = {
+                    param($m)
+                    if ($m.Msg -eq 0x0312 -and $m.WParam.ToInt32() -eq $hotKeyId) {
+                        $menu.Show([System.Windows.Forms.Cursor]::Position)
+                    }
+                    & $originalWndProc ([ref]$m)
+                }
+            }
+        }
+
+        [System.Windows.Forms.Application]::Run()
+    })
+
+    $null = $ps.BeginInvoke()
+
+    $global:tray=$ps
+
+    Write-Host "Tray icon '$Tooltip' created. Right-click and choose 'Exit' to remove it."
+    return @{ PowerShell = $ps; Runspace = $runspace }
+}
+
+# ---------- Auto-Claude Docker helpers ----------
+function Find-AutoClaudeContainer {
+    $container = docker ps --format "{{.Names}}" 2>$null | Where-Object { $_ -match 'claude' } | Select-Object -First 1
+    if (-not $container) {
+        Write-Error "No running auto-claude container found"
+        return $null
+    }
+    return $container
+}
+
+function Copy-ToAutoClaude {
+    param(
+        [Parameter(Mandatory, Position = 0)][string]$HostPath,
+        [Parameter(Position = 1)][string]$ContainerPath = "/workspace"
+    )
+
+    $container = Find-AutoClaudeContainer
+    if (-not $container) { return }
+
+    $resolved = Resolve-Path $HostPath -ErrorAction Stop
+    $name = Split-Path $resolved -Leaf
+    $dest = "$ContainerPath/$name"
+
+    Write-Host "Copying '$resolved' -> '${container}:${dest}' ..."
+    docker cp "$resolved" "${container}:${dest}"
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Done. Files available at $dest inside container." -ForegroundColor Green
+    } else {
+        Write-Error "docker cp failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Test-Port([int]$Port, [int]$TimeoutMs = 200) {
+<#
+.SYNOPSIS
+Fast check whether a TCP port is listening on localhost.
+.PARAMETER Port
+Port number to test.
+.PARAMETER TimeoutMs
+Connection timeout in milliseconds (default 200).
+#>
+    try {
+        $tcp = [System.Net.Sockets.TcpClient]::new()
+        $task = $tcp.ConnectAsync('127.0.0.1', $Port)
+        $connected = $task.Wait($TimeoutMs) -and $tcp.Connected
+        $tcp.Dispose()
+        return $connected
+    } catch { return $false }
+}
