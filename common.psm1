@@ -384,32 +384,97 @@ Command line pattern (wildcard). Defaults to '*'.
 .PARAMETER Title
 Main window title pattern (wildcard). Defaults to '*'.
 .PARAMETER ShowTable
-If specified, returns a formatted table with Id, Name, MainWindowTitle, and CommandLine columns.
+If specified, returns the raw Process objects instead of the default summary (Id, Name, PrivateMB, CPU(s), MainWindowTitle, CommandLine).
+.PARAMETER Tree
+If specified, also includes descendant processes (recursively) of each match, indented under their parent.
+.PARAMETER ParentId
+If specified (non-zero), only include processes whose parent process id equals this value.
 #>
     param(
         [Parameter(Position=0)]
         [string]$Proc = "*",
-        
+
         [Parameter(Position=1)]
         [string]$cmd = "*",
-        
+
         [Parameter()]
         [string]$Title = "*",
-        
+
         [Parameter()]
-        [switch]$ShowTable
+        [switch]$ShowTable,
+
+        [Parameter()]
+        [switch]$Tree,
+
+        [Parameter()]
+        [switch]$Object,
+
+        [Parameter()]
+        [int]$ParentId = 0
     )
-    
-    $processes = Get-Process | Where-Object { 
-        $_.Name -like $Proc -and 
-        $_.CommandLine -like $cmd -and
-        ($_.MainWindowTitle -like $Title)
+
+    $allCim = Get-CimInstance Win32_Process
+    $ppidMap = @{}
+    $pnameMap = @{}
+    $byParent = @{}
+    foreach ($p in $allCim) {
+        $ppidMap[[int]$p.ProcessId] = [int]$p.ParentProcessId
+        $pnameMap[[int]$p.ProcessId] = [string]$p.Name
+        if (-not $byParent.ContainsKey([int]$p.ParentProcessId)) {
+            $byParent[[int]$p.ParentProcessId] = @()
+        }
+        $byParent[[int]$p.ParentProcessId] += $p
     }
-    
-    if ($ShowTable) {
-        $processes | Select-Object Id, Name, MainWindowTitle, CommandLine
+
+    $processes = Get-Process | Where-Object {
+        $_.Name -like $Proc -and
+        $_.CommandLine -like $cmd -and
+        ($_.MainWindowTitle -like $Title) -and
+        ($ParentId -eq 0 -or $ppidMap[[int]$_.Id] -eq $ParentId)
+    }
+
+    if ($Tree) {
+        $allProc = @{}
+        Get-Process | ForEach-Object { $allProc[[int]$_.Id] = $_ }
+
+        $rows = New-Object System.Collections.Generic.List[object]
+        $seen = @{}
+        $emit = {
+            param($pid_, $depth)
+            if ($seen.ContainsKey($pid_)) { return }
+            $seen[$pid_] = $true
+            $proc = $allProc[$pid_]
+            if ($proc) {
+                $rows.Add([pscustomobject]@{
+                    Id              = $proc.Id
+                    PPID            = $ppidMap[[int]$proc.Id]
+                    PName           = $pnameMap[[int]$ppidMap[[int]$proc.Id]]
+                    Name            = ('  ' * $depth) + $proc.Name
+                    PrivateMB       = [math]::Round($proc.PrivateMemorySize64 / 1MB, 1)
+                    'CPU(s)'        = if ($proc.CPU) { [math]::Round($proc.CPU, 1) } else { 0 }
+                    MainWindowTitle = $proc.MainWindowTitle
+                    CommandLine     = $proc.CommandLine
+                })
+            }
+            if ($byParent.ContainsKey($pid_)) {
+                foreach ($child in $byParent[$pid_]) {
+                    & $emit ([int]$child.ProcessId) ($depth + 1)
+                }
+            }
+        }
+        foreach ($p in $processes) { & $emit ([int]$p.Id) 0 }
+        $rows
+    }
+    elseif ($ShowTable) {
+        $processes
     } else {
-        $processes 
+        $processes | Select-Object Id, `
+            @{Name='PPID'; Expression={ $ppidMap[[int]$_.Id] }}, `
+            @{Name='PName'; Expression={ $pnameMap[[int]$ppidMap[[int]$_.Id]] }}, `
+            Name, `
+            @{Name='PrivateMB'; Expression={ [math]::Round($_.PrivateMemorySize64 / 1MB, 1) }}, `
+            @{Name='CPU(s)'; Expression={ if ($_.CPU) { [math]::Round($_.CPU, 1) } else { 0 } }}, `
+            MainWindowTitle, CommandLine
     }
 }
 
@@ -581,7 +646,7 @@ The file path or partial name to check for locking processes.
 
     # Define the path to Handle.exe
     # //$Handle = "G:\Sysinternals\handle.exe"
-    $Handle = "C:\SysinternalsSuite\handle.exe"
+    $Handle = "C:\SysinternalsSuite\handle64.exe"
 
     # //[regex]$matchPattern = "(?<Name>\w+\.\w+)\s+pid:\s+(?<PID>\b(\d+)\b)\s+type:\s+(?<Type>\w+)\s+\w+:\s+(?<Path>.*)"
     # //[regex]$matchPattern = "(?<Name>\w+\.\w+)\s+pid:\s+(?<PID>\d+)\s+type:\s+(?<Type>\w+)\s+\w+:\s+(?<Path>.*)"
@@ -2264,8 +2329,112 @@ Connection timeout in milliseconds (default 200).
         return $connected
     } catch { return $false }
 }
-function RunClaudeDir($d) 
+function RunClaudeDir($d)
 {
     cd $d
     claude
+}
+
+# --- Generic parameter-forwarding helpers (from previous monolithic profile) ---
+
+function AddWrapper([parameter(mandatory=$true, position=0)][string]$For,[parameter(mandatory=$true, position=1)][string]$To)
+{
+    $paramDictionary = [System.Management.Automation.RuntimeDefinedParameterDictionary]::new()
+    $paramset= $(Get-Command $For).Parameters.Values | %{[System.Management.Automation.RuntimeDefinedParameter]::new($_.Name,$_.ParameterType,$_.Attributes)}
+    $paramsetlet= $(Get-Command empt).Parameters.Keys
+    $paramsetlet+= $(Get-Command $To).ScriptBlock.Ast.Body.ParamBlock.Parameters.Name | %{ $_.VariablePath.UserPath }
+    $paramset | %{ if ( -not ($paramsetlet -contains $_.Name) )
+        {$paramDictionary.Add($_.Name,$_)
+        }}
+    return $paramDictionary
+}
+
+function GetRestOfParams()
+{
+    Param([parameter(mandatory=$true, position=1)][hashtable]$params,
+        [parameter(mandatory=$true, position=0)][string]$dstsource,
+        [parameter(mandatory=$false, position=2)][switch][bool]$dontincludecommon=$true)
+    $dstorgparams=$(Get-Command $dstsource).Parameters.Keys
+    $z= $params
+    if ( -not $dontincludecommon)
+    {
+        $z.Keys | %{ if ( -not ($dstorgparams -contains $_) )
+            {$z.Remove($_)
+            } } | Out-Null
+    } else
+    {
+        $dyn= $(Get-Command $dstsource).Parameters.Values | Where-Object -Property IsDynamic -Eq $false
+        $dyn | %{ $z.Remove($_.Name) } | Out-Null
+    }
+    return $z
+}
+
+function Empt
+{
+    [CmdletBinding()]
+    Param([parameter(mandatory=$true, position=0)][string]$aaaa)
+    1
+}
+
+function Let
+{
+    [CmdletBinding()]
+    Param([parameter(mandatory=$true, position=0)][string]$Option,[parameter(mandatory=$false, position=0)][string]$OptionB)
+    DynamicParam
+    {
+        AddWrapper -For Get -To $MyInvocation.MyCommand.Name
+    }
+    Begin
+    {
+        $params = GetRestOfParams Let $PSBoundParameters -dontincludecommon
+    }
+    Process
+    {
+        Get @params -OptionB ( $OptionB + "1" )
+    }
+}
+
+function Get
+{
+    [CmdLetBinding()]
+    Param([parameter(mandatory=$false, position=0)][string]$OptionA,
+        [parameter(mandatory=$false, position=1)][string]$OptionB)
+    Write-Host "opta",$OptionA
+    Write-Host "optb",$OptionB
+}
+
+function Grant-UserRW {
+<#
+.SYNOPSIS
+Recursively grants the current user read/write (Modify) permission on a path.
+Takes ownership first if the initial icacls grant fails (typical for files
+owned by SYSTEM/TrustedInstaller or another user).
+.PARAMETER Path
+Root file or directory to fix. Defaults to current directory.
+#>
+    param(
+        [Parameter(Position=0)][string]$Path = (Get-Location).Path
+    )
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Error "Path not found: $Path"
+        return
+    }
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $user = "$env:USERDOMAIN\$env:USERNAME"
+    Write-Host "Granting Modify to $user on $resolved ..."
+    icacls $resolved /grant "${user}:(OI)(CI)M" /T /C | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Initial grant had errors ($LASTEXITCODE). Taking ownership and retrying..."
+        if (Test-Path -LiteralPath $resolved -PathType Container) {
+            takeown /F $resolved /R /D Y | Out-Null
+        } else {
+            takeown /F $resolved | Out-Null
+        }
+        icacls $resolved /grant "${user}:(OI)(CI)M" /T /C | Out-Null
+    }
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Done."
+    } else {
+        Write-Warning "icacls finished with exit code $LASTEXITCODE - some items may not have been updated."
+    }
 }
