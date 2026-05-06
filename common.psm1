@@ -6,11 +6,17 @@
 #Set-PSReadlineOption -AddToHistoryHandler
 #  $x | where { $y=cat $_ | ss  -Pattern "\bcall" | ss "\bput" ; $y.Length -ge 1 }
 #Write-Host "started"
+function cc 
+{
+    claude --continue
+}
 New-Alias ss Select-String
 New-Alias z Get-Help -ErrorAction SilentlyContinue
 New-Alias m Get-Member
 New-Alias P pwsh
 New-Alias gitp GitPullKeepLocal
+New-Alias cl claude
+
 # Remove the default cd alias
 # Create a new cd function
 #
@@ -188,6 +194,18 @@ $parameters = @{
     }
 }
 Set-PSReadLineKeyHandler @parameters
+$parameters = @{
+    Key = 'Alt+c'
+    BriefDescription = 'Open claude in last dir'
+    LongDescription = 'Pick a previously visited directory via fzf and open claude there'
+    ScriptBlock = {
+        param($key, $arg)
+        [Microsoft.PowerShell.PSConsoleReadLine]::RevertLine()
+        [Microsoft.PowerShell.PSConsoleReadLine]::Insert('ClaudeLast')
+        [Microsoft.PowerShell.PSConsoleReadLine]::AcceptLine()
+    }
+}
+Set-PSReadLineKeyHandler @parameters
 
 
 
@@ -302,6 +320,21 @@ Presents the list of known visited directories (from StupidHist) via fzf and nav
 }
 # Create an alias for CdLast
 Set-Alias q CdLast
+function ClaudeLast
+{
+<#
+.SYNOPSIS
+Pick a previously visited directory via fzf and open claude there.
+.DESCRIPTION
+Uses StupidHist to list visited directories, presents them via fzf, prompts for confirmation, then runs claude.exe in the selected directory.
+#>
+    $location = StupidHist | FZF
+    if (-not $location) { return }
+
+
+    cd  $location
+    try { claude.exe @args } finally {  }
+}
 function ConVM
 {
 <#
@@ -460,15 +493,20 @@ The WSL path to convert.
 #>
     wsl bash -c "wslpath -w '$fil'"
 }
-function RunBash($fil)
+function RunInBash
 {
 <#
 .SYNOPSIS
-Executes a command in WSL bash with the user's bash profile sourced.
-.PARAMETER fil
-The bash command string to execute.
+Sources ~/.bash_profile in WSL and runs the given command.
+.DESCRIPTION
+Joins all arguments into a single bash command line, sources /home/ekarni/.bash_profile, then executes the command in WSL bash.
 #>
-    wsl bash -c "source /home/ekarni/.bash_profile; $fil"
+    $cmd = $args -join ' '
+$c= @" 
+wsl.exe bash -c `"source /home/ekarni/.bash_profile && $cmd`"
+"@
+Write-Host $c
+    iex $c
 }
 function Show-Window
 {
@@ -1944,6 +1982,28 @@ Sets the DELL U2419H monitor as the primary display.
     $di=  $(Get-DisplayInfo | ? {$_.DisplayName -eq  "DELL U2419H"} ).DisplayId
     Set-DisplayPrimary -DisplayId $di
 }
+function SetExtendedDisplayPort()
+{
+<#
+.SYNOPSIS
+Sets extended display mode and makes the DisplayPort monitor the primary display.
+.DESCRIPTION
+Finds all DisplayPort-connected monitors via Get-DisplayInfo, enables them as extended displays, and sets the first one as the primary display.
+#>
+    $dpDisplays = Get-DisplayInfo | Where-Object { $_.ConnectionType -eq 'DisplayPort' }
+    if (-not $dpDisplays) {
+        Write-Warning "No DisplayPort monitor found."
+        return
+    }
+    $dpIds = @($dpDisplays | ForEach-Object { $_.DisplayId })
+    # Switch to "Extend these displays" mode
+    DisplaySwitch.exe /extend
+    # Enable as extended (not cloned)
+    Enable-Display -DisplayId $dpIds
+    # Set the first DisplayPort display as primary
+    Set-DisplayPrimary -DisplayId $dpIds[0]
+    Write-Host "DisplayPort monitor '$($dpDisplays[0].DisplayName)' (ID $($dpIds[0])) set as extended primary display." -ForegroundColor Green
+}
 function RunWTAdmin()
 {
 <#
@@ -2203,4 +2263,9 @@ Connection timeout in milliseconds (default 200).
         $tcp.Dispose()
         return $connected
     } catch { return $false }
+}
+function RunClaudeDir($d) 
+{
+    cd $d
+    claude
 }
