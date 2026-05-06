@@ -275,6 +275,9 @@ function OptInWtKeys
 }
 
 $global:jsonFile = Join-Path -Path $env:USERPROFILE -ChildPath ('cmdLines.json' )
+# Shared shell-state file consumed by window_switcher: map PID -> {title, cwd, time, processid, command}.
+# Concurrent shells coordinate via a named mutex.
+$global:wsStateFile = 'C:\temp\wt_state.json'
 
 function Read-CmdLinesStore
 {
@@ -530,6 +533,47 @@ The executable name to look up.
 #>
     python -c "import shutil; print(shutil.which('$arg'))"
 }
+Function Get-ProcessCwd {
+<#
+.SYNOPSIS
+Reads the current working directory of a process by reading its PEB. 64-bit only.
+#>
+    param([Parameter(Mandatory)][int]$Id)
+    if (-not ('Util.PebReader' -as [type])) {
+        Add-Type -NameSpace Util -Name PebReader -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool CloseHandle(IntPtr h);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, IntPtr size, out IntPtr read);
+[DllImport("ntdll.dll")]
+public static extern int NtQueryInformationProcess(IntPtr h, int infoClass, IntPtr buf, int len, out int ret);
+'@
+    }
+    $h = [Util.PebReader]::OpenProcess(0x1010, $false, $Id)
+    if ($h -eq [IntPtr]::Zero) { return $null }
+    try {
+        $pbi = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(48)
+        try {
+            $rl = 0
+            if ([Util.PebReader]::NtQueryInformationProcess($h, 0, $pbi, 48, [ref]$rl) -ne 0) { return $null }
+            $peb = [System.Runtime.InteropServices.Marshal]::ReadIntPtr($pbi, 8)
+        } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pbi) }
+        $buf = New-Object byte[] 8; $r = [IntPtr]::Zero
+        if (-not [Util.PebReader]::ReadProcessMemory($h, [IntPtr]([long]$peb + 0x20), $buf, [IntPtr]8, [ref]$r)) { return $null }
+        $procParams = [IntPtr][BitConverter]::ToInt64($buf, 0)
+        $us = New-Object byte[] 16
+        if (-not [Util.PebReader]::ReadProcessMemory($h, [IntPtr]([long]$procParams + 0x38), $us, [IntPtr]16, [ref]$r)) { return $null }
+        $len = [BitConverter]::ToUInt16($us, 0)
+        if ($len -eq 0) { return '' }
+        $bufPtr = [IntPtr][BitConverter]::ToInt64($us, 8)
+        $str = New-Object byte[] $len
+        if (-not [Util.PebReader]::ReadProcessMemory($h, $bufPtr, $str, [IntPtr]$len, [ref]$r)) { return $null }
+        ([System.Text.Encoding]::Unicode.GetString($str)).TrimEnd('\')
+    } finally { [Util.PebReader]::CloseHandle($h) | Out-Null }
+}
+
 Function LookFor {
 <#
 .SYNOPSIS
@@ -2478,6 +2522,7 @@ public static class HotKeyHelper {
     Write-Host "Tray icon '$Tooltip' created. Right-click and choose 'Exit' to remove it."
     return @{ PowerShell = $ps; Runspace = $runspace }
 }
+
 
 # ---------- Auto-Claude Docker helpers ----------
 function Find-AutoClaudeContainer {
