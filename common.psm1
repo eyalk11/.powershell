@@ -126,23 +126,27 @@ The PSObject, array, or scalar value to convert. Accepts pipeline input.
 }
 
 $global:jsonFile = Join-Path -Path $env:USERPROFILE -ChildPath ('cmdLines.json' )
+# Shared shell-state file consumed by window_switcher: map PID -> {title, cwd, time, processid, command}.
+# Concurrent shells coordinate via a named mutex.
+$global:wsStateFile = 'C:\temp\wt_state.json'
 
 $ExecutionContext.InvokeCommand.PostCommandLookupAction = {
-try{ 
+try{
     $cmdLine = $MyInvocation.Line
     if ($args[1].CommandOrigin -ne 'Runspace' -or $cmdLine -match 'PostCommandLookupAction|^prompt$')
-    { return 
+    { return
     }
 
     $currentDir = (Get-Location).Path
 
-    if (!(Test-Path -Path $global:jsonFile))
+    if (!(Test-Path -Path $global:jsonFile) -or (Get-Item $global:jsonFile).Length -eq 0)
     {
         @{ $currentDir = @($cmdLine) } | ConvertTo-Json | Set-Content -Path $global:jsonFile
     } else
     {
-        $existingCmdLines = Get-Content -Path $global:jsonFile | ConvertFrom-Json 
+        $existingCmdLines = Get-Content -Path $global:jsonFile -Raw | ConvertFrom-Json
         $existingCmdLines = ConvertPSObjectToHashtable $existingCmdLines
+        if ($null -eq $existingCmdLines) { $existingCmdLines = @{} }
 
         if (!$existingCmdLines.ContainsKey($currentDir))
         {
@@ -156,7 +160,41 @@ try{
         }
         $existingCmdLines | ConvertTo-Json | Set-Content -Path $global:jsonFile
     }
-    }catch { 
+
+    # window_switcher state export ---
+    $entry = [ordered]@{
+        title     = $Host.UI.RawUI.WindowTitle
+        cwd       = $currentDir
+        time      = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+        processid = $PID
+        command   = $cmdLine
+    }
+    $mutex = New-Object System.Threading.Mutex($false, 'Global\WindowSwitcherStateMutex')
+    try {
+        [void]$mutex.WaitOne(1500)
+        $state = @{}
+        if (Test-Path -LiteralPath $global:wsStateFile) {
+            try {
+                $raw = Get-Content -Raw -LiteralPath $global:wsStateFile -ErrorAction Stop
+                if ($raw) {
+                    $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+                    $state = ConvertPSObjectToHashtable $obj
+                    if ($null -eq $state) { $state = @{} }
+                }
+            } catch { $state = @{} }
+        }
+        foreach ($k in @($state.Keys)) {
+            if (-not (Get-Process -Id ([int]$k) -ErrorAction SilentlyContinue)) {
+                $state.Remove($k)
+            }
+        }
+        $state["$PID"] = $entry
+        $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $global:wsStateFile -Encoding UTF8
+    } finally {
+        [void]$mutex.ReleaseMutex()
+        $mutex.Dispose()
+    }
+    }catch {
 Write-Debug "error in PostCommandLookupAction: $_"
     }
 }
@@ -218,8 +256,10 @@ Interactively select a command previously run in the current directory.
 Reads the per-directory command history JSON file and presents matching commands for the current directory via fzf.
 #>
     $currentDir = (Get-Location).Path
-    $existingCmdLines = Get-Content -Path $global:jsonFile | ConvertFrom-Json 
+    if (!(Test-Path -Path $global:jsonFile) -or (Get-Item $global:jsonFile).Length -eq 0) { return '' }
+    $existingCmdLines = Get-Content -Path $global:jsonFile -Raw | ConvertFrom-Json
     $existingCmdLines = ConvertPSObjectToHashtable $existingCmdLines
+    if ($null -eq $existingCmdLines -or -not $existingCmdLines.ContainsKey($currentDir)) { return '' }
     $existingCmdLines[$currentDir] | fzf
 }
 function MyCD
@@ -371,6 +411,47 @@ The executable name to look up.
 #>
     python -c "import shutil; print(shutil.which('$arg'))"
 }
+Function Get-ProcessCwd {
+<#
+.SYNOPSIS
+Reads the current working directory of a process by reading its PEB. 64-bit only.
+#>
+    param([Parameter(Mandatory)][int]$Id)
+    if (-not ('Util.PebReader' -as [type])) {
+        Add-Type -NameSpace Util -Name PebReader -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool CloseHandle(IntPtr h);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool ReadProcessMemory(IntPtr h, IntPtr addr, byte[] buf, IntPtr size, out IntPtr read);
+[DllImport("ntdll.dll")]
+public static extern int NtQueryInformationProcess(IntPtr h, int infoClass, IntPtr buf, int len, out int ret);
+'@
+    }
+    $h = [Util.PebReader]::OpenProcess(0x1010, $false, $Id)
+    if ($h -eq [IntPtr]::Zero) { return $null }
+    try {
+        $pbi = [System.Runtime.InteropServices.Marshal]::AllocHGlobal(48)
+        try {
+            $rl = 0
+            if ([Util.PebReader]::NtQueryInformationProcess($h, 0, $pbi, 48, [ref]$rl) -ne 0) { return $null }
+            $peb = [System.Runtime.InteropServices.Marshal]::ReadIntPtr($pbi, 8)
+        } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($pbi) }
+        $buf = New-Object byte[] 8; $r = [IntPtr]::Zero
+        if (-not [Util.PebReader]::ReadProcessMemory($h, [IntPtr]([long]$peb + 0x20), $buf, [IntPtr]8, [ref]$r)) { return $null }
+        $procParams = [IntPtr][BitConverter]::ToInt64($buf, 0)
+        $us = New-Object byte[] 16
+        if (-not [Util.PebReader]::ReadProcessMemory($h, [IntPtr]([long]$procParams + 0x38), $us, [IntPtr]16, [ref]$r)) { return $null }
+        $len = [BitConverter]::ToUInt16($us, 0)
+        if ($len -eq 0) { return '' }
+        $bufPtr = [IntPtr][BitConverter]::ToInt64($us, 8)
+        $str = New-Object byte[] $len
+        if (-not [Util.PebReader]::ReadProcessMemory($h, $bufPtr, $str, [IntPtr]$len, [ref]$r)) { return $null }
+        ([System.Text.Encoding]::Unicode.GetString($str)).TrimEnd('\')
+    } finally { [Util.PebReader]::CloseHandle($h) | Out-Null }
+}
+
 Function LookFor {
 <#
 .SYNOPSIS
@@ -384,7 +465,7 @@ Command line pattern (wildcard). Defaults to '*'.
 .PARAMETER Title
 Main window title pattern (wildcard). Defaults to '*'.
 .PARAMETER ShowTable
-If specified, returns the raw Process objects instead of the default summary (Id, Name, PrivateMB, CPU(s), MainWindowTitle, CommandLine).
+If specified, returns the raw Process objects instead of the default summary (Id, Name, PrivateMB, CPU(s), MainWindowTitle, CommandLine, Cwd).
 .PARAMETER Tree
 If specified, also includes descendant processes (recursively) of each match, indented under their parent.
 .PARAMETER ParentId
@@ -454,6 +535,7 @@ If specified (non-zero), only include processes whose parent process id equals t
                     'CPU(s)'        = if ($proc.CPU) { [math]::Round($proc.CPU, 1) } else { 0 }
                     MainWindowTitle = $proc.MainWindowTitle
                     CommandLine     = $proc.CommandLine
+                    Cwd             = Get-ProcessCwd -Id $proc.Id
                 })
             }
             if ($byParent.ContainsKey($pid_)) {
@@ -474,7 +556,8 @@ If specified (non-zero), only include processes whose parent process id equals t
             Name, `
             @{Name='PrivateMB'; Expression={ [math]::Round($_.PrivateMemorySize64 / 1MB, 1) }}, `
             @{Name='CPU(s)'; Expression={ if ($_.CPU) { [math]::Round($_.CPU, 1) } else { 0 } }}, `
-            MainWindowTitle, CommandLine
+            MainWindowTitle, CommandLine, `
+            @{Name='Cwd'; Expression={ Get-ProcessCwd -Id $_.Id }}
     }
 }
 
@@ -2216,6 +2299,13 @@ public static class HotKeyHelper {
 
         $notifyIcon.ContextMenuStrip = $menu
 
+        # Ensure tray icon is removed if the message loop exits for any reason
+        # (graceful runspace shutdown when parent pwsh exits cleanly).
+        $cleanup = {
+            try { if ($notifyIcon) { $notifyIcon.Visible = $false; $notifyIcon.Dispose() } } catch {}
+        }
+        [System.Windows.Forms.Application]::add_ApplicationExit($cleanup)
+
         # Setup hotkey if provided
         if ($TrayHotKey) {
             $hiddenForm = New-Object System.Windows.Forms.Form
@@ -2269,16 +2359,32 @@ public static class HotKeyHelper {
             }
         }
 
-        [System.Windows.Forms.Application]::Run()
+        try {
+            [System.Windows.Forms.Application]::Run()
+        } finally {
+            try { if ($notifyIcon) { $notifyIcon.Visible = $false; $notifyIcon.Dispose() } } catch {}
+        }
     })
 
     $null = $ps.BeginInvoke()
 
     $global:tray=$ps
+    $global:trayRunspace = $runspace
+    $global:trayMutex = $mutex
+
+    # Dispose tray cleanly when this pwsh exits, so we don't leak a ghost icon.
+    Register-EngineEvent -SourceIdentifier PowerShell.Exiting -SupportEvent -Action {
+        try {
+            if ($global:tray)         { $global:tray.Stop(); $global:tray.Dispose() }
+            if ($global:trayRunspace) { $global:trayRunspace.Close(); $global:trayRunspace.Dispose() }
+            if ($global:trayMutex)    { try { $global:trayMutex.ReleaseMutex() } catch {}; $global:trayMutex.Dispose() }
+        } catch {}
+    } | Out-Null
 
     Write-Host "Tray icon '$Tooltip' created. Right-click and choose 'Exit' to remove it."
     return @{ PowerShell = $ps; Runspace = $runspace }
 }
+
 
 # ---------- Auto-Claude Docker helpers ----------
 function Find-AutoClaudeContainer {
@@ -2437,4 +2543,202 @@ Root file or directory to fix. Defaults to current directory.
     } else {
         Write-Warning "icacls finished with exit code $LASTEXITCODE - some items may not have been updated."
     }
+}
+
+function Repair-Bluetooth {
+<#
+.SYNOPSIS
+Restarts Bluetooth radio adapters stuck in CM_PROB_FAILED_START (Code 10).
+.DESCRIPTION
+When Windows reports Bluetooth as off but bthserv is running, the radio
+adapter itself may have failed to start (typically NTStatus 0xC000025E
+STATUS_DEVICE_POWER_FAILURE). Disable/Enable-PnpDevice often does NOT clear
+this; pnputil /restart-device does. Requires elevation.
+#>
+    param(
+        [string]$Match = '*Bluetooth*'
+    )
+    $radios = Get-PnpDevice -Class Bluetooth | Where-Object {
+        $_.FriendlyName -like $Match -and $_.InstanceId -like 'USB\*'
+    }
+    if (-not $radios) { Write-Warning "No Bluetooth USB radio matched '$Match'."; return }
+    foreach ($r in $radios) {
+        Write-Host "$($r.FriendlyName)  Status=$($r.Status)  Problem=$($r.Problem)"
+        if ($r.Status -ne 'OK') {
+            pnputil /restart-device $r.InstanceId
+            Start-Sleep -Seconds 2
+            Get-PnpDevice -InstanceId $r.InstanceId | Format-List FriendlyName,Status,Problem
+        } else {
+            Write-Host "  (already OK, skipping)"
+        }
+    }
+}
+
+function ConvertTo-LineEnding {
+<#
+.SYNOPSIS
+Convert line endings of a file in place (LF <-> CRLF). Preserves bytes otherwise.
+#>
+    param(
+        [Parameter(Mandatory=$true, Position=0, ValueFromPipeline=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][ValidateSet('LF','CRLF')][string]$Eol
+    )
+    process {
+        $resolved = (Resolve-Path -LiteralPath $Path).Path
+        $bytes = [System.IO.File]::ReadAllBytes($resolved)
+        # Strip CR (0x0D); for CRLF, re-insert before each LF (0x0A).
+        $out = New-Object System.Collections.Generic.List[byte]
+        foreach ($b in $bytes) {
+            if ($b -eq 0x0D) { continue }
+            if ($Eol -eq 'CRLF' -and $b -eq 0x0A) { $out.Add([byte]0x0D) }
+            $out.Add($b)
+        }
+        [System.IO.File]::WriteAllBytes($resolved, $out.ToArray())
+        Write-Host "$Eol  $resolved"
+    }
+}
+
+function dos2unix {
+    param([Parameter(Mandatory=$true, Position=0, ValueFromPipeline=$true)][string[]]$Path)
+    process { foreach ($p in $Path) { ConvertTo-LineEnding -Path $p -Eol LF } }
+}
+
+function unix2dos {
+    param([Parameter(Mandatory=$true, Position=0, ValueFromPipeline=$true)][string[]]$Path)
+    process { foreach ($p in $Path) { ConvertTo-LineEnding -Path $p -Eol CRLF } }
+}
+
+Set-Alias windows2dos unix2dos
+
+function tail {
+<#
+.SYNOPSIS
+Unix-like tail. Prints the last N lines of a file; -f follows for new content.
+#>
+    param(
+        [Parameter(Mandatory=$true, Position=0, ValueFromPipeline=$true)][string]$Path,
+        [Alias('n')][int]$Lines = 10,
+        [Alias('f')][switch]$Follow
+    )
+    process {
+        if ($Follow) { Get-Content -LiteralPath $Path -Tail $Lines -Wait }
+        else         { Get-Content -LiteralPath $Path -Tail $Lines }
+    }
+}
+
+function Invoke-NotebookCell {
+<#
+.SYNOPSIS
+Run a single Jupyter notebook cell (by index or substring match) with all preceding code cells included so dependencies are satisfied.
+.PARAMETER Path
+Path to the .ipynb file.
+.PARAMETER Index
+Zero-based cell index to run.
+.PARAMETER Match
+Substring matched against each code cell's source; first hit wins.
+.PARAMETER Python
+Python executable used to run nbconvert. Defaults to .\.venv11\Scripts\python.exe if present, else 'python'.
+.PARAMETER Kernel
+Jupyter kernel name. Default 'python3'.
+.PARAMETER Timeout
+Per-cell execution timeout in seconds. Default 120.
+#>
+    [CmdletBinding(DefaultParameterSetName='ByIndex')]
+    param(
+        [Parameter(Mandatory=$true, Position=0)][string]$Path,
+        [Parameter(Mandatory=$true, ParameterSetName='ByIndex')][int]$Index,
+        [Parameter(Mandatory=$true, ParameterSetName='ByMatch')][string]$Match,
+        [string]$Python,
+        [string]$Kernel = 'python3',
+        [int]$Timeout = 120
+    )
+
+    if (-not (Test-Path $Path)) { throw "Notebook not found: $Path" }
+    $Path = (Resolve-Path $Path).Path
+
+    if (-not $Python) {
+        $cand = Join-Path (Get-Location) '.venv11\Scripts\python.exe'
+        $Python = if (Test-Path $cand) { $cand } else { 'python' }
+    }
+
+    $tmpIn  = [IO.Path]::GetTempFileName() + '.ipynb'
+    $tmpOut = [IO.Path]::GetTempFileName() + '.ipynb'
+
+    $py = @"
+import json, sys
+src   = json.load(open(r'$Path','r',encoding='utf-8'))
+mode  = '$($PSCmdlet.ParameterSetName)'
+idx   = $Index
+match = r'''$Match'''
+cells = src['cells']
+target = None
+if mode == 'ByIndex':
+    if idx < 0 or idx >= len(cells):
+        sys.exit(f'index {idx} out of range (0..{len(cells)-1})')
+    target = idx
+else:
+    for i,c in enumerate(cells):
+        if c.get('cell_type') == 'code' and match in ''.join(c.get('source', [])):
+            target = i; break
+    if target is None:
+        sys.exit(f'no code cell matched: {match!r}')
+keep = []
+for i,c in enumerate(cells[:target+1]):
+    if c.get('cell_type') == 'code':
+        nc = dict(c)
+        nc['outputs'] = []
+        nc['execution_count'] = None
+        keep.append(nc)
+src['cells'] = keep
+src.setdefault('metadata', {}).setdefault('kernelspec', {'name':'$Kernel','display_name':'$Kernel'})
+json.dump(src, open(r'$tmpIn','w',encoding='utf-8'), ensure_ascii=False)
+print(f'target={target} kept={len(keep)}')
+"@
+    $py | & $Python -
+
+    if ($LASTEXITCODE -ne 0) { Remove-Item -EA SilentlyContinue $tmpIn,$tmpOut; return }
+
+    $env:PYTHONNOUSERSITE = '1'
+    $exec = @"
+import sys, nbformat
+from nbclient import NotebookClient
+nb = nbformat.read(r'$tmpIn', as_version=4)
+client = NotebookClient(nb, timeout=$Timeout, kernel_name='$Kernel', allow_errors=True)
+client.execute()
+nbformat.write(nb, r'$tmpOut')
+print('[exec] done')
+"@
+    $exec | & $Python -
+
+    $report = @"
+import json
+nb = json.load(open(r'$tmpOut','r',encoding='utf-8'))
+last = nb['cells'][-1]
+print('--- target cell source ---')
+print(''.join(last.get('source', []))[:400])
+print('--- outputs ---')
+err = False
+for o in last.get('outputs', []):
+    t = o.get('output_type')
+    if t == 'stream':
+        name = o.get('name','stdout')
+        print('[' + name + ']')
+        print(''.join(o.get('text', [])))
+    elif t == 'error':
+        err = True
+        print('[ERROR] ' + str(o.get('ename')) + ': ' + str(o.get('evalue')))
+        for line in o.get('traceback', []):
+            print(line)
+    elif t in ('execute_result','display_data'):
+        d = o.get('data', {})
+        txt = d.get('text/plain')
+        if isinstance(txt, list): txt = ''.join(txt)
+        head = (txt[:400] if txt else str(list(d.keys())))
+        print('[' + t + '] ' + head)
+import sys; sys.exit(2 if err else 0)
+"@
+    $report | & $Python -
+    $rc = $LASTEXITCODE
+    Remove-Item -EA SilentlyContinue $tmpIn,$tmpOut
+    if ($rc -eq 2) { Write-Host 'cell raised an exception' -ForegroundColor Red }
 }
