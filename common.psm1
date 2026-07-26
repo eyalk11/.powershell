@@ -17,6 +17,14 @@ Set-Alias P pwsh
 Set-Alias gitp GitPullKeepLocal
 Set-Alias cl claude
 Set-Alias dt duptab
+function  lastls()
+{
+<#
+.SYNOPSIS
+List directory entries newest-first (Get-ChildItem sorted by LastWriteTime descending).
+#>
+    Get-ChildItem @args  -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+}
 function ci {
     claude-history -g
 }
@@ -371,6 +379,65 @@ Serializes the whole read-modify-write across all shells with a named mutex, so 
     }
 }
 
+function Update-WindowSwitcherState
+{
+<#
+.SYNOPSIS
+Publish this shell's title/cwd/last-command into the shared window_switcher state file.
+.DESCRIPTION
+Writes $global:wsStateFile as a map PID -> {title, cwd, time, processid, command}, pruning
+entries whose process is gone. Concurrent shells serialize on a named mutex.
+#>
+    param([Parameter(Mandatory)][string]$CommandLine)
+
+    $entry = [ordered]@{
+        title     = $Host.UI.RawUI.WindowTitle
+        cwd       = (Get-Location).Path
+        time      = [DateTimeOffset]::Now.ToUnixTimeSeconds()
+        processid = $PID
+        command   = $CommandLine
+    }
+    $mutex = New-Object System.Threading.Mutex($false, 'Global\WindowSwitcherStateMutex')
+    try {
+        [void]$mutex.WaitOne(1500)
+        $state = @{}
+        if (Test-Path -LiteralPath $global:wsStateFile) {
+            try {
+                $raw = Get-Content -Raw -LiteralPath $global:wsStateFile -ErrorAction Stop
+                if ($raw) {
+                    $obj = $raw | ConvertFrom-Json -ErrorAction Stop
+                    $state = ConvertPSObjectToHashtable $obj
+                    if ($null -eq $state) { $state = @{} }
+                }
+            } catch { $state = @{} }
+        }
+        foreach ($k in @($state.Keys)) {
+            if (-not (Get-Process -Id ([int]$k) -ErrorAction SilentlyContinue)) {
+                $state.Remove($k)
+            }
+        }
+        $state["$PID"] = $entry
+        $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $global:wsStateFile -Encoding UTF8
+    } finally {
+        [void]$mutex.ReleaseMutex()
+        $mutex.Dispose()
+    }
+}
+
+# window_switcher state export runs unconditionally (independent of $global:enable_wt_keys).
+# wtkeys.ps1 replaces PostCommandLookupAction when opted in; it re-invokes this same function.
+$ExecutionContext.InvokeCommand.PostCommandLookupAction = {
+    try {
+        $cmdLine = $MyInvocation.Line
+        if ($args[1].CommandOrigin -ne 'Runspace' -or $cmdLine -match 'PostCommandLookupAction|^prompt$')
+        { return }
+
+        Update-WindowSwitcherState -CommandLine $cmdLine
+    } catch {
+        Write-Debug "error in PostCommandLookupAction: $_"
+    }
+}
+
 function GrepOnCurDir()
 {
 <#
@@ -497,6 +564,103 @@ Uses StupidHist to list visited directories, presents them via fzf, prompts for 
     cd  $location
     try { claude.exe @args } finally {  }
 }
+function Find-ClaudeSessionExact
+{
+<#
+.SYNOPSIS
+Find a past Claude Code session by exact content snippet and resume it.
+.DESCRIPTION
+Greps every ~/.claude/projects/*/*.jsonl for the given snippet (or the clipboard if no arg),
+picks the most recently modified match (or lists matches when ambiguous), cds to that session's
+recorded cwd, and runs `claude --resume <session-id>`. Use Find-ClaudeSession (fcs) for fuzzy /
+contextual matching via the agent.
+.EXAMPLE
+fcse            # use clipboard
+fcse "some unique snippet"
+#>
+    param(
+        [Parameter(Position=0, ValueFromRemainingArguments=$true)]
+        [string[]]$Snippet
+    )
+    $text = if ($Snippet) { ($Snippet -join ' ') } else { Get-Clipboard -Raw }
+    if (-not $text) { Write-Error "No snippet provided and clipboard is empty."; return }
+    $text = $text.Trim()
+    # Pick a distinctive line: longest non-empty line, capped at 200 chars
+    $needle = ($text -split "`r?`n" | Where-Object { $_.Trim() } | Sort-Object Length -Descending | Select-Object -First 1)
+    if (-not $needle) { Write-Error "Snippet had no usable text."; return }
+    if ($needle.Length -gt 200) { $needle = $needle.Substring(0, 200) }
+    Write-Host "Searching for: $needle" -ForegroundColor Cyan
+
+    $root = Join-Path $env:USERPROFILE '.claude\projects'
+    $hits = Select-String -Path (Join-Path $root '*\*.jsonl') -Pattern ([regex]::Escape($needle)) -SimpleMatch -List -ErrorAction SilentlyContinue
+    if (-not $hits) { Write-Error "No session matched."; return }
+
+    $matches = $hits | ForEach-Object {
+        $f = Get-Item $_.Path
+        [pscustomobject]@{
+            SessionId = [System.IO.Path]::GetFileNameWithoutExtension($f.Name)
+            Project   = $f.Directory.Name
+            Path      = $f.FullName
+            Modified  = $f.LastWriteTime
+        }
+    } | Sort-Object Modified -Descending
+
+    if ($matches.Count -gt 1) {
+        Write-Host "Multiple matches (newest first):" -ForegroundColor Yellow
+        $matches | Format-Table Modified, Project, SessionId -AutoSize | Out-Host
+        Write-Host "Resuming the most recent." -ForegroundColor Yellow
+    }
+    $pick = $matches[0]
+
+    # Pull cwd from the first json line in the transcript (each entry has a "cwd" field).
+    $cwd = $null
+    foreach ($line in (Get-Content -LiteralPath $pick.Path -TotalCount 5)) {
+        try { $obj = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+        if ($obj.cwd) { $cwd = $obj.cwd; break }
+    }
+    if (-not $cwd) { Write-Error "Could not determine cwd from $($pick.Path)"; return }
+
+    Write-Host "Resuming session $($pick.SessionId) in $cwd" -ForegroundColor Green
+    Set-Location -LiteralPath $cwd
+    & claude --resume $pick.SessionId
+}
+Set-Alias fcse Find-ClaudeSessionExact -ErrorAction SilentlyContinue
+
+function Find-ClaudeSession
+{
+<#
+.SYNOPSIS
+Find a past Claude Code session by contextual/fuzzy match (via the agent) and resume it.
+.DESCRIPTION
+Launches `claude` with the /find-session-by-content skill, passing the clipboard (or the given
+text) as context. The agent decides which session best matches — useful when you don't have an
+exact substring but remember the topic, file, or general gist. The agent prints the resume
+command for you to run; use Find-ClaudeSessionExact (fcse) for byte-exact substring search.
+.EXAMPLE
+fcs            # use clipboard
+fcs "we were debugging the GBp avg cost bug"
+#>
+    param(
+        [Parameter(Position=0, ValueFromRemainingArguments=$true)]
+        [string[]]$Context
+    )
+    $text = if ($Context) { ($Context -join ' ') } else { Get-Clipboard -Raw }
+    if (-not $text) { Write-Error "No context provided and clipboard is empty."; return }
+
+    $prompt = @"
+/find-session-by-content
+
+Find the relevant session across all projects under ~/.claude/projects based on the context
+below. Report the session id, cwd, and the resume command.
+
+--- CONTEXT BEGIN ---
+$text
+--- CONTEXT END ---
+"@
+    & claude $prompt
+}
+Set-Alias fcs Find-ClaudeSession -ErrorAction SilentlyContinue
+
 function ConVM
 {
 <#
@@ -2897,6 +3061,18 @@ this; pnputil /restart-device does. Requires elevation.
     }
 }
 
+function Find-HungUI {
+<#
+.SYNOPSIS
+List UI processes that are Not Responding (same check Task Manager uses).
+#>
+    Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and -not $_.Responding } |
+        Select-Object Name, Id, MainWindowTitle,
+            @{N='MemMB';E={[math]::Round($_.WorkingSet64/1MB,0)}}
+}
+
+Set-Alias hungui Find-HungUI
+
 function ConvertTo-LineEnding {
 <#
 .SYNOPSIS
@@ -3389,3 +3565,66 @@ function Kill-Port {
     }
 }
 Set-Alias killport Kill-Port
+
+function claude_go {
+<#
+.SYNOPSIS
+Sleep until the Claude usage limit resets, then resume with a message.
+.DESCRIPTION
+Parses the reset time out of `claude -p 'check'`, sleeps until it, then re-launches claude in
+auto permission mode with the given message (optionally resuming a specific session).
+#>
+    param(
+        [Parameter(Position=0)]
+        [string]$message = "go on",
+
+        [Parameter(Position=1)]
+        [string]$sessionId,
+
+        [Parameter(Position=2, ValueFromRemainingArguments=$true)]
+        [string[]]$additionalArgs
+    )
+
+    # 1. Fetch raw check output
+    $checkOutput = (claude -p 'check') -join ' '
+
+    # 2. Extract valid time using Regex (matches times like "05:00 AM", "17:30:00", "5:00 PM")
+    if ($checkOutput -match '(\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?)') {
+        $extractedTimeString = $Matches[1]
+    } else {
+        Write-Error "Could not parse reset time from output: '$checkOutput'"
+        return
+    }
+
+    # 3. Parse time and compute target DateTime
+    $now = Get-Date
+    $parsedTime = [datetime]::Parse($extractedTimeString)
+
+    $targetTime = Get-Date -Year $now.Year -Month $now.Month -Day $now.Day `
+                           -Hour $parsedTime.Hour -Minute $parsedTime.Minute -Second $parsedTime.Second
+
+    if ($targetTime -lt $now) {
+        $targetTime = $targetTime.AddDays(1)
+    }
+
+    $sleepDurationSeconds = [math]::Max(0, [math]::Round(($targetTime - $now).TotalSeconds)+8)
+
+    Write-Host "Sleeping for $sleepDurationSeconds seconds until $targetTime ($extractedTimeString)..."
+    Start-Sleep -Seconds $sleepDurationSeconds
+
+    # 4. Construct CLI Arguments with auto permission mode
+    $claudeArgs = @('--permission-mode', 'auto')
+
+    if (-not [string]::IsNullOrWhiteSpace($sessionId)) {
+        $claudeArgs += @('--resume', $sessionId)
+    }
+
+    if ($additionalArgs) {
+        $claudeArgs += $additionalArgs
+    }
+
+    $claudeArgs += @('-c', $message)
+
+    # Execute Claude command
+    claude @claudeArgs
+}

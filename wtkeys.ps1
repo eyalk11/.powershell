@@ -81,6 +81,8 @@ try{
     }
 
     Add-CmdLineRecord -Dir (Get-Location).Path -CommandLine $cmdLine
+    # Keep the window_switcher export alive — this handler replaces the one common.psm1 installs.
+    Update-WindowSwitcherState -CommandLine $cmdLine
     }catch {
 Write-Debug "error in PostCommandLookupAction: $_"
     }

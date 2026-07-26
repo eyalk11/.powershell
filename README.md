@@ -99,6 +99,7 @@ This writes `$global:enable_wt_keys=$true` to `config.ps1`, which is loaded auto
 | `FindGitFile`   | Show full git log for a file, following renames (`git log --follow`)       |
 | `Which`         | Locate the full path of an executable (like Unix `which`)                  |
 | `Get-MD5`       | Compute MD5 hash of a string or file                                       |
+| `lastls`        | List directory entries newest-first (by `LastWriteTime`)                   |
 
 ### Git Utilities
 
@@ -120,6 +121,7 @@ This writes `$global:enable_wt_keys=$true` to `config.ps1`, which is loaded auto
 | `Show-Window`       | Bring a process window to the foreground (restore if minimized)        |
 | `Get-LockingProcess`| Find processes locking a file (uses Sysinternals `handle.exe`)         |
 | `KillByName`        | Kill all processes matching a name pattern                              |
+| `Find-HungUI`       | List UI processes that are Not Responding (alias `hungui`)              |
 
 ### WSL Integration
 
