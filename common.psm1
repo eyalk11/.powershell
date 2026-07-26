@@ -3566,13 +3566,69 @@ function Kill-Port {
 }
 Set-Alias killport Kill-Port
 
-function claude_go {
+function Get-ClaudeResetTime {
+<#
+.SYNOPSIS
+Return the next Claude usage-limit reset as a [datetime].
+.DESCRIPTION
+Parses the reset time out of `claude -p 'check'`. If that time has already passed today it rolls
+forward to tomorrow. Writes an error and returns nothing when the output can't be parsed.
+#>
+    $checkOutput = (claude -p 'check') -join ' '
+
+    # Extract valid time using Regex (matches times like "05:00 AM", "17:30:00", "5:00 PM")
+    if ($checkOutput -match '(\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?)') {
+        $extractedTimeString = $Matches[1]
+    } else {
+        Write-Error "Could not parse reset time from output: '$checkOutput'"
+        return
+    }
+
+    $now = Get-Date
+    $parsedTime = [datetime]::Parse($extractedTimeString)
+
+    $targetTime = Get-Date -Year $now.Year -Month $now.Month -Day $now.Day `
+                           -Hour $parsedTime.Hour -Minute $parsedTime.Minute -Second $parsedTime.Second
+
+    if ($targetTime -lt $now) {
+        $targetTime = $targetTime.AddDays(1)
+    }
+
+    $targetTime
+}
+
+function Get-ClaudeGoArgs {
+<#
+.SYNOPSIS
+Build the claude CLI argument list shared by ClaudeGo and ClaudeGoTask.
+#>
+    param(
+        [string]$Message,
+        [string]$SessionId,
+        [string[]]$AdditionalArgs
+    )
+    $claudeArgs = @('--permission-mode', 'auto')
+
+    if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
+        $claudeArgs += @('--resume', $SessionId)
+    }
+
+    if ($AdditionalArgs) {
+        $claudeArgs += $AdditionalArgs
+    }
+
+    $claudeArgs + @('-c', $Message)
+}
+
+function ClaudeGo {
 <#
 .SYNOPSIS
 Sleep until the Claude usage limit resets, then resume with a message.
 .DESCRIPTION
-Parses the reset time out of `claude -p 'check'`, sleeps until it, then re-launches claude in
-auto permission mode with the given message (optionally resuming a specific session).
+Blocks the current shell until the reset time reported by `claude -p 'check'`, then re-launches
+claude in auto permission mode with the given message (optionally resuming a specific session).
+The sleep is suspended along with the machine, so this only works if the box stays awake --
+use ClaudeGoTask to have Windows wake it at the reset time instead.
 #>
     param(
         [Parameter(Position=0)]
@@ -3585,46 +3641,147 @@ auto permission mode with the given message (optionally resuming a specific sess
         [string[]]$additionalArgs
     )
 
-    # 1. Fetch raw check output
-    $checkOutput = (claude -p 'check') -join ' '
+    $targetTime = Get-ClaudeResetTime
+    if (-not $targetTime) { return }
 
-    # 2. Extract valid time using Regex (matches times like "05:00 AM", "17:30:00", "5:00 PM")
-    if ($checkOutput -match '(\d{1,2}:\d{2}(:\d{2})?\s*(AM|PM)?)') {
-        $extractedTimeString = $Matches[1]
-    } else {
-        Write-Error "Could not parse reset time from output: '$checkOutput'"
+    $sleepDurationSeconds = [math]::Max(0, [math]::Round(($targetTime - (Get-Date)).TotalSeconds)+8)
+
+    Write-Host "Sleeping for $sleepDurationSeconds seconds until $targetTime..."
+    Start-Sleep -Seconds $sleepDurationSeconds
+
+    claude @(Get-ClaudeGoArgs -Message $message -SessionId $sessionId -AdditionalArgs $additionalArgs)
+}
+
+function ClaudeGoTask {
+<#
+.SYNOPSIS
+Wake the machine at the next Claude usage-limit reset and resume there.
+.DESCRIPTION
+Like ClaudeGo, but instead of blocking the shell it registers a one-shot scheduled task named
+'ClaudeGo' that fires at the reset time and opens a PowerShell window in the current directory
+running claude interactively. The task is registered -WakeToRun, so a sleeping machine is woken
+just in time; that needs "Allow wake timers" enabled for the active power scheme (checked and
+warned about here) and only works from sleep or hibernate, not from a full shutdown.
+Re-registering replaces any pending run, so only one is ever queued. Requires an interactive
+logon at the trigger time. Use -Cancel to drop a pending run; `Get-ScheduledTask ClaudeGo` shows it.
+.EXAMPLE
+ClaudeGoTask
+.EXAMPLE
+ClaudeGoTask "continue the refactor" 6c072c4c-2a4b-4c43-a2b9-12389f66df5f
+.EXAMPLE
+ClaudeGoTask -Cancel
+#>
+    param(
+        [Parameter(Position=0)]
+        [string]$message = "go on",
+
+        [Parameter(Position=1)]
+        [string]$sessionId,
+
+        [Parameter(Position=2, ValueFromRemainingArguments=$true)]
+        [string[]]$additionalArgs,
+
+        [switch]$Cancel
+    )
+
+    $taskName = 'ClaudeGo'
+
+    if ($Cancel) {
+        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+            Write-Host "Cancelled pending '$taskName' task." -ForegroundColor Yellow
+        } else {
+            Write-Host "No pending '$taskName' task." -ForegroundColor DarkGray
+        }
         return
     }
 
-    # 3. Parse time and compute target DateTime
-    $now = Get-Date
-    $parsedTime = [datetime]::Parse($extractedTimeString)
+    $targetTime = Get-ClaudeResetTime
+    if (-not $targetTime) { return }
 
-    $targetTime = Get-Date -Year $now.Year -Month $now.Month -Day $now.Day `
-                           -Hour $parsedTime.Hour -Minute $parsedTime.Minute -Second $parsedTime.Second
+    # Single-quote everything we splice into the -Command string, doubling any embedded quotes.
+    $dir     = (Get-Location).Path
+    $dirLit  = "'" + ($dir -replace "'", "''") + "'"
+    $argLits = (Get-ClaudeGoArgs -Message $message -SessionId $sessionId -AdditionalArgs $additionalArgs |
+                    ForEach-Object { "'" + ($_ -replace "'", "''") + "'" }) -join ' '
+    $command = "Set-Location $dirLit; claude $argLits"
 
-    if ($targetTime -lt $now) {
-        $targetTime = $targetTime.AddDays(1)
+    # Relaunch whatever host we're running under (same idiom as p).
+    $exe = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+
+    $action    = New-ScheduledTaskAction -Execute $exe -Argument "-NoExit -NoProfile -Command `"$command`""
+    $trigger   = New-ScheduledTaskTrigger -Once -At $targetTime
+    $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+                                            -LogonType Interactive -RunLevel Limited
+    # WakeToRun is the whole point: wake the box just in time. The battery switches matter too --
+    # without them Windows refuses to start (and won't wake for) the task on DC power.
+    # ExecutionTimeLimit 0 = unlimited, so the interactive session isn't killed after the 3-day default.
+    $settings  = New-ScheduledTaskSettingsSet -WakeToRun -StartWhenAvailable -AllowStartIfOnBatteries `
+                                              -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero)
+
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+                           -Principal $principal -Settings $settings -Force | Out-Null
+
+    Write-Host "Scheduled '$taskName' for $targetTime in $dir" -ForegroundColor Green
+    Write-Host "  claude $argLits" -ForegroundColor DarkGray
+    Write-Host "  cancel with: ClaudeGoTask -Cancel" -ForegroundColor DarkGray
+
+    Assert-WakeTimersEnabled
+}
+
+$script:AllowWakeGuid = 'BD3B718A-0680-4D9D-8AB2-E1D2B4AC806D'   # SUB_SLEEP\ALLOWWAKE
+
+function Get-WakeTimerSetting {
+<#
+.SYNOPSIS
+Read "Allow wake timers" for the active power scheme, per power source.
+.DESCRIPTION
+Emits one object per source with Source (AC/DC), Value (0 = disabled, 1 = enabled,
+2 = important wake timers only) and Meaning. Only 1 lets a scheduled task wake the machine --
+mode 2 admits system-critical timers only, not user tasks.
+#>
+    $raw = powercfg /query SCHEME_CURRENT SUB_SLEEP $script:AllowWakeGuid 2>$null
+    if (-not $raw) { return }
+
+    $meaning = @{ 0 = 'disabled'; 1 = 'enabled'; 2 = 'important wake timers only' }
+    foreach ($m in ([regex]::Matches(($raw -join "`n"), 'Current (AC|DC) Power Setting Index:\s*0x([0-9a-fA-F]+)'))) {
+        $value = [Convert]::ToInt32($m.Groups[2].Value, 16)
+        [pscustomobject]@{
+            Source  = $m.Groups[1].Value
+            Value   = $value
+            Meaning = if ($meaning.ContainsKey($value)) { $meaning[$value] } else { "0x$($m.Groups[2].Value)" }
+        }
     }
+}
 
-    $sleepDurationSeconds = [math]::Max(0, [math]::Round(($targetTime - $now).TotalSeconds)+8)
-
-    Write-Host "Sleeping for $sleepDurationSeconds seconds until $targetTime ($extractedTimeString)..."
-    Start-Sleep -Seconds $sleepDurationSeconds
-
-    # 4. Construct CLI Arguments with auto permission mode
-    $claudeArgs = @('--permission-mode', 'auto')
-
-    if (-not [string]::IsNullOrWhiteSpace($sessionId)) {
-        $claudeArgs += @('--resume', $sessionId)
+function Assert-WakeTimersEnabled {
+<#
+.SYNOPSIS
+Warn if "Allow wake timers" is off for the active power scheme, which silently breaks -WakeToRun.
+#>
+    foreach ($s in (Get-WakeTimerSetting | Where-Object Value -ne 1)) {
+        Write-Warning "Wake timers are $($s.Meaning) on $($s.Source) power -- the task will not wake the machine."
+        Write-Host "  fix with: Enable-WakeTimers" -ForegroundColor DarkGray
     }
+}
 
-    if ($additionalArgs) {
-        $claudeArgs += $additionalArgs
-    }
+function Enable-WakeTimers {
+<#
+.SYNOPSIS
+Turn on "Allow wake timers" for the active power scheme, on both AC and battery.
+.DESCRIPTION
+Without this a -WakeToRun scheduled task (see ClaudeGoTask) is registered happily but never wakes
+a sleeping machine. Sets ALLOWWAKE to 1 for AC and DC, then commits with /setactive -- the
+set*valueindex calls only stage the edit, /setactive is what applies it. Elevates via su.
+#>
+    $cmd = @(
+        "powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP $script:AllowWakeGuid 1"
+        "powercfg /setdcvalueindex SCHEME_CURRENT SUB_SLEEP $script:AllowWakeGuid 1"
+        "powercfg /setactive SCHEME_CURRENT"
+    ) -join '; '
 
-    $claudeArgs += @('-c', $message)
+    su ([scriptblock]::Create($cmd))
 
-    # Execute Claude command
-    claude @claudeArgs
+    if (IsAdmin) { Get-WakeTimerSetting | Format-Table -AutoSize | Out-Host }
+    else { Write-Host "Approve the UAC prompt, then check with: Get-WakeTimerSetting" -ForegroundColor DarkGray }
 }
