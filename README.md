@@ -122,6 +122,20 @@ This writes `$global:enable_wt_keys=$true` to `config.ps1`, which is loaded auto
 | `Get-LockingProcess`| Find processes locking a file (uses Sysinternals `handle.exe`)         |
 | `KillByName`        | Kill all processes matching a name pattern                              |
 | `Find-HungUI`       | List UI processes that are Not Responding (alias `hungui`)              |
+| `Start-ChatGPTDevTools`| Relaunch the ChatGPT desktop app with remote debugging and open DevTools in Chrome |
+| `Kill-Port`         | Kill the process(es) listening on a TCP port (alias `killport`, `-WhatIf` supported) |
+| `Test-Port`         | Fast check whether a TCP port is listening on localhost                 |
+| `Respawn`           | Kill the main process(es) matching a name and relaunch each from its original path |
+| `Get-ProcessCwd`    | Read a process's current working directory out of its PEB (64-bit only) |
+
+### Claude
+
+| Function       | Description                                                                          |
+|----------------|--------------------------------------------------------------------------------------|
+| `ClaudeGo`     | Block until the Claude usage limit resets, then resume with a message                |
+| `ClaudeGoTask` | Same, but via a `-WakeToRun` scheduled task that wakes the machine (`-Cancel` to drop)|
+| `Enable-WakeTimers` | Turn on "Allow wake timers" — without it `ClaudeGoTask` never wakes the box     |
+| `SearchConv`   | Search past Claude Code conversations and resume the best match here                 |
 
 ### WSL Integration
 

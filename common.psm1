@@ -1809,6 +1809,14 @@ git
  <#
  .SYNOPSIS
  Git pull that stashes local changes, pulls, then reapplies them with conflict resolution prompts.
+ .DESCRIPTION
+ Stashes, fetches, pulls (or checks out $branch), then restores only the paths the stash actually
+ touched -- restoring everything would revert freshly pulled files to the pre-pull tree.
+ If the pull/checkout is refused because untracked files would be overwritten, those files are
+ named in git's output; they get popped, staged, re-stashed (so they're covered by the stash) and
+ the pull/checkout is retried. Tracks whether a stash was actually created -- `git stash save`
+ reports "No local changes to save" and creates nothing on a clean tree, and popping in that case
+ would pop somebody else's stash.
  .PARAMETER keeplocalinconflict
  Keep local version when the same file changed both locally and remotely.
  .PARAMETER dontkeepstash
@@ -1835,6 +1843,16 @@ git
      )
      function DoPull($x)
      {
+<#
+.SYNOPSIS
+Inner helper of GitPullAdvanced: pull, rebasing onto $repository/$branch when one was given.
+.DESCRIPTION
+Closes over GitPullAdvanced's $branch/$repository params. $x is splatted on as extra git arguments.
+Callers capture its output (with 2>&1) to detect the "untracked working tree files would be
+overwritten" refusal, so it must not swallow stderr.
+.COMPONENT
+git
+#>
          if ($branch )
          {
              if (-not $repository) {Write-Error "no repo";return }
@@ -1852,24 +1870,37 @@ git
  
  
      $commit_hash=$(git rev-parse HEAD)
-     git stash save | Out-Null
+     $stashsave = git stash save
+     $stashed = -not ($stashsave -match 'No local changes to save')
      $outcheckout=""
-     git fetch 
+     $outpull=""
+     git fetch
      if ($checkout)
      {
-         $outcheckout=git checkout $branch 2>&1 
+         $outcheckout=git checkout $branch 2>&1
          echo $outcheckout
      }else {
-         DoPull
+         $outpull = DoPull 2>&1
+         echo $outpull
      }
-     if ($outcheckout -like "*The following untracked working tree files would be overwritten*") {
-         $y= $outcheckout | where { $_  -like "`t*" }  | %{ $($_ | Out-string) -replace "`t","" } | %{ $_ -replace "`r`n","" } | %{ $_ -replace "`n","" }
+     $outmerge = @($outcheckout) + @($outpull)
+     if ($outmerge | where { $_ -like "*The following untracked working tree files would be overwritten*" }) {
+         $y= $outmerge | where { $_  -like "`t*" }  | %{ $($_ | Out-string) -replace "`t","" } | %{ $_ -replace "`r`n","" } | %{ $_ -replace "`n","" }
          echo "adding to stash $y"
-         git stash pop
+         if ($stashed) { git stash pop }
          $y | %{ git add $_ }
          git stash  | Out-Null
-         git checkout $branch 2>&1
- 
+         $stashed = $true
+         if ($checkout)
+         {
+             $outcheckout = git checkout $branch 2>&1
+             echo $outcheckout
+         }
+         else
+         {
+             $outpull = DoPull 2>&1
+             echo $outpull
+         }
      }
      if (-not $?)
      {
@@ -1904,8 +1935,12 @@ no just cancels (type exactly)
          if (-not $?){Write-Host "unsucessful pull";return}
      }
  
-     # Checkout files from the stash
-     git checkout stash -- . | Out-Null
+     # Checkout files from the stash - only the paths the stash actually touched,
+     # otherwise every freshly pulled file gets reverted to the pre-pull tree.
+     if (-not $stashed) { return }
+     $stashfiles = @(git stash show --include-untracked --name-only 'stash@{0}')
+     if (-not $stashfiles) { return }
+     git checkout stash -- @stashfiles | Out-Null
      git reset | Out-Null
      $localch= $(git diff --name-only)
      $int = $localch | ?{ $changes -contains $_  } 
@@ -2270,6 +2305,16 @@ utility
 
     # Helper function to get source line from file
     function Get-SourceLine($scriptPath, $lineNumber) {
+<#
+.SYNOPSIS
+Return the trimmed text of a single 1-based line of a script file, or $null.
+.DESCRIPTION
+Inner helper of Format-ErrorWithStackTrace. Returns $null rather than throwing for every failure
+mode -- missing path, out-of-range line, unreadable file -- because it runs while formatting an
+error and must never raise a second one.
+.COMPONENT
+utility
+#>
         if ($scriptPath -and $lineNumber -and (Test-Path $scriptPath)) {
             try {
                 $lines = Get-Content $scriptPath -ErrorAction SilentlyContinue
@@ -2285,6 +2330,16 @@ utility
 
     # Helper function to enhance stack trace with source lines
     function Add-SourceLinesToStackTrace($stackTrace) {
+<#
+.SYNOPSIS
+Interleave a "SOURCE:" line under every stack frame that names a file and line number.
+.DESCRIPTION
+Inner helper of Format-ErrorWithStackTrace. Matches frames of the form
+"at <ScriptBlock>, <path>: line <n>" and looks each one up with Get-SourceLine; frames that don't
+match the pattern, or whose file can't be read, are passed through untouched.
+.COMPONENT
+utility
+#>
         if (-not $stackTrace) { return "" }
 
         $enhancedTrace = ""
@@ -4189,4 +4244,53 @@ windows
 
     if (IsAdmin) { Get-WakeTimerSetting | Format-Table -AutoSize | Out-Host }
     else { Write-Host "Approve the UAC prompt, then check with: Get-WakeTimerSetting" -ForegroundColor DarkGray }
+}
+
+function Start-ChatGPTDevTools {
+<#
+.SYNOPSIS
+Relaunch the ChatGPT desktop app (Electron) with remote debugging and open its DevTools in Chrome.
+.DESCRIPTION
+The Store-packaged ChatGPT app (OpenAI.Codex) is Electron, but only honours --remote-debugging-port
+at launch and holds a single-instance lock -- so a running copy has to be killed first. If the debug
+endpoint is already listening the app is left alone and DevTools just attaches.
+devtools:// URLs are blocked from the command line, so the frontend is loaded from the HTTP copy the
+debug port itself serves.
+.PARAMETER Port
+Remote debugging port. Default 9222.
+.PARAMETER Force
+Restart the app even if the debug endpoint is already listening.
+.COMPONENT
+windows
+#>
+    param(
+        [int]$Port = 9222,
+        [switch]$Force
+    )
+
+    $list = { try { Invoke-RestMethod "http://127.0.0.1:$Port/json/list" -TimeoutSec 3 } catch { $null } }
+
+    if ($Force -or -not (& $list)) {
+        # prefer the version actually running -- several package versions sit side by side under WindowsApps
+        $exe = (Get-Process ChatGPT -ErrorAction SilentlyContinue | Select-Object -First 1).Path
+        if (-not $exe) {
+            $exe = @(Get-Item "C:\Program Files\WindowsApps\OpenAI.Codex_*_x64__*\app\ChatGPT.exe" -ErrorAction SilentlyContinue |
+                Sort-Object { [version]($_.FullName -replace '.*OpenAI\.Codex_([\d.]+)_.*', '$1') })[-1].FullName
+        }
+        if (-not $exe) { Write-Error "ChatGPT desktop app not found under WindowsApps"; return }
+
+        Get-Process ChatGPT -ErrorAction SilentlyContinue | Stop-Process -Force
+        Start-Sleep -Seconds 2
+        Start-Process $exe -ArgumentList "--remote-debugging-port=$Port"
+    }
+
+    $t = $null
+    foreach ($i in 1..20) {
+        $t = @(& $list | Where-Object { $_.type -eq 'page' -and $_.url -notmatch 'overlay' })[0]
+        if ($t) { break }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $t) { Write-Error "no debug target on port $Port"; return }
+
+    Start-Process chrome.exe "http://127.0.0.1:$Port/devtools/inspector.html?ws=$($t.webSocketDebuggerUrl -replace '^ws://','')"
 }
