@@ -29,6 +29,8 @@ function  lastls()
 <#
 .SYNOPSIS
 List directory entries newest-first (Get-ChildItem sorted by LastWriteTime descending).
+.COMPONENT
+files
 #>
     Get-ChildItem @args  -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
 }
@@ -441,6 +443,8 @@ Publish this shell's title/cwd/last-command into the shared window_switcher stat
 .DESCRIPTION
 Writes $global:wsStateFile as a map PID -> {title, cwd, time, processid, command}, pruning
 entries whose process is gone. Concurrent shells serialize on a named mutex.
+.COMPONENT
+windows
 #>
     param([Parameter(Mandatory)][string]$CommandLine)
 
@@ -645,6 +649,8 @@ contextual matching via the agent.
 .EXAMPLE
 fcse            # use clipboard
 fcse "some unique snippet"
+.COMPONENT
+claude
 #>
     param(
         [Parameter(Position=0, ValueFromRemainingArguments=$true)]
@@ -707,6 +713,8 @@ command for you to run; use Find-ClaudeSessionExact (fcse) for byte-exact substr
 .EXAMPLE
 fcs            # use clipboard
 fcs "we were debugging the GBp avg cost bug"
+.COMPONENT
+claude
 #>
     param(
         [Parameter(Position=0, ValueFromRemainingArguments=$true)]
@@ -775,6 +783,8 @@ Function Get-ProcessCwd {
 <#
 .SYNOPSIS
 Reads the current working directory of a process by reading its PEB. 64-bit only.
+.COMPONENT
+process
 #>
     param([Parameter(Mandatory)][int]$Id)
     if (-not ('Util.PebReader' -as [type])) {
@@ -3371,6 +3381,8 @@ function Find-HungUI {
 <#
 .SYNOPSIS
 List UI processes that are Not Responding (same check Task Manager uses).
+.COMPONENT
+process
 #>
     Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and -not $_.Responding } |
         Select-Object Name, Id, MainWindowTitle,
@@ -3952,6 +3964,8 @@ Return the next Claude usage-limit reset as a [datetime].
 .DESCRIPTION
 Parses the reset time out of `claude -p 'check'`. If that time has already passed today it rolls
 forward to tomorrow. Writes an error and returns nothing when the output can't be parsed.
+.COMPONENT
+claude
 #>
     $checkOutput = (claude -p 'check') -join ' '
 
@@ -3980,6 +3994,8 @@ function Get-ClaudeGoArgs {
 <#
 .SYNOPSIS
 Build the claude CLI argument list shared by ClaudeGo and ClaudeGoTask.
+.COMPONENT
+claude
 #>
     param(
         [string]$Message,
@@ -4008,6 +4024,8 @@ Blocks the current shell until the reset time reported by `claude -p 'check'`, t
 claude in auto permission mode with the given message (optionally resuming a specific session).
 The sleep is suspended along with the machine, so this only works if the box stays awake --
 use ClaudeGoTask to have Windows wake it at the reset time instead.
+.COMPONENT
+claude
 #>
     param(
         [Parameter(Position=0)]
@@ -4049,6 +4067,8 @@ ClaudeGoTask
 ClaudeGoTask "continue the refactor" 6c072c4c-2a4b-4c43-a2b9-12389f66df5f
 .EXAMPLE
 ClaudeGoTask -Cancel
+.COMPONENT
+claude
 #>
     param(
         [Parameter(Position=0)]
@@ -4118,6 +4138,8 @@ Read "Allow wake timers" for the active power scheme, per power source.
 Emits one object per source with Source (AC/DC), Value (0 = disabled, 1 = enabled,
 2 = important wake timers only) and Meaning. Only 1 lets a scheduled task wake the machine --
 mode 2 admits system-critical timers only, not user tasks.
+.COMPONENT
+windows
 #>
     $raw = powercfg /query SCHEME_CURRENT SUB_SLEEP $script:AllowWakeGuid 2>$null
     if (-not $raw) { return }
@@ -4137,6 +4159,8 @@ function Assert-WakeTimersEnabled {
 <#
 .SYNOPSIS
 Warn if "Allow wake timers" is off for the active power scheme, which silently breaks -WakeToRun.
+.COMPONENT
+windows
 #>
     foreach ($s in (Get-WakeTimerSetting | Where-Object Value -ne 1)) {
         Write-Warning "Wake timers are $($s.Meaning) on $($s.Source) power -- the task will not wake the machine."
@@ -4152,6 +4176,8 @@ Turn on "Allow wake timers" for the active power scheme, on both AC and battery.
 Without this a -WakeToRun scheduled task (see ClaudeGoTask) is registered happily but never wakes
 a sleeping machine. Sets ALLOWWAKE to 1 for AC and DC, then commits with /setactive -- the
 set*valueindex calls only stage the edit, /setactive is what applies it. Elevates via su.
+.COMPONENT
+windows
 #>
     $cmd = @(
         "powercfg /setacvalueindex SCHEME_CURRENT SUB_SLEEP $script:AllowWakeGuid 1"
