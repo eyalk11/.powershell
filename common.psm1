@@ -20,7 +20,7 @@ Set-Alias ss Select-String
 Set-Alias z Get-Help -ErrorAction SilentlyContinue
 Set-Alias m Get-Member
 Set-Alias P pwsh
-Set-Alias gitp GitPullKeepLocal
+Set-Alias gitp GitPullAdvanced
 Set-Alias cl claude
 Set-Alias dt duptab
 set-alias cr claude-resume
@@ -1810,13 +1810,21 @@ git
  .SYNOPSIS
  Git pull that stashes local changes, pulls, then reapplies them with conflict resolution prompts.
  .DESCRIPTION
- Stashes, fetches, pulls (or checks out $branch), then restores only the paths the stash actually
- touched -- restoring everything would revert freshly pulled files to the pre-pull tree.
+ Stashes, fetches, pulls (or checks out $branch), then reapplies the stashes with
+ `git stash apply --index`. Apply merges the stashed *diff* onto the new HEAD, so freshly pulled
+ files are untouched and the staged/unstaged split survives. Restoring path-by-path with
+ `git checkout <stash> -- <paths>` cannot do this: a staged deletion is not in the stash tree, the
+ pathspec fails to match, and git aborts the entire checkout -- taking every other path with it.
  If the pull/checkout is refused because untracked files would be overwritten, those files are
- named in git's output; they get popped, staged, re-stashed (so they're covered by the stash) and
- the pull/checkout is retried. Tracks whether a stash was actually created -- `git stash save`
- reports "No local changes to save" and creates nothing on a clean tree, and popping in that case
- would pop somebody else's stash.
+ named in git's output; they go into a second, path-limited `git stash push -u -- <paths>` and the
+ pull/checkout is retried. Path-limited so that unrelated staged work is not swept in with them.
+ Counts the stashes actually created -- `git stash push` reports "No local changes to save" and
+ creates nothing on a clean tree, and acting as though it had would later reapply somebody
+ else's stash@{0}.
+ The pull always rebases, so a conflict is always a rebase conflict and `git rebase --abort` is
+ always the right cleanup.
+ Nothing is dropped unless -dontkeepstash, so any failure leaves the work recoverable in the
+ stash list.
  .PARAMETER keeplocalinconflict
  Keep local version when the same file changed both locally and remotely.
  .PARAMETER dontkeepstash
@@ -1853,16 +1861,68 @@ overwritten" refusal, so it must not swallow stderr.
 .COMPONENT
 git
 #>
+         # core.quotepath=false so non-ASCII filenames in the "would be overwritten"
+         # list arrive raw instead of quoted-and-escaped -- UntrackedBlockers feeds
+         # them straight back to git, and a \303\251 style name would not resolve.
          if ($branch )
          {
              if (-not $repository) {Write-Error "no repo";return }
-             git pull --rebase $repository $branch @x
+             git -c core.quotepath=false pull --rebase $repository $branch @x
          }
-         else 
+         else
          {
-             git pull @x
+             git -c core.quotepath=false pull --rebase @x
          }
- 
+
+     }
+     function UntrackedBlockers($lines)
+     {
+<#
+.SYNOPSIS
+Inner helper of GitPullAdvanced: the filenames git refused to overwrite.
+.DESCRIPTION
+Returns only the run of tab-indented names directly following the "would be
+overwritten" header. Filtering the whole output for tab-indented lines instead
+also catches git's hint blocks and checkout's own file lists, and every name it
+picks up gets stashed.
+.COMPONENT
+git
+#>
+         $out = @()
+         $collecting = $false
+         foreach ($raw in $lines) {
+             foreach ($t in ("$raw" -split "`r?`n")) {
+                 if ($t -like "*The following untracked working tree files would be overwritten*") {
+                     $collecting = $true
+                     continue
+                 }
+                 if (-not $collecting) { continue }
+                 if ($t -notlike "`t*") { $collecting = $false; continue }
+                 $out += ($t -replace "^`t","")
+             }
+         }
+         $out
+     }
+     function PopOurStashes($n)
+     {
+<#
+.SYNOPSIS
+Inner helper of GitPullAdvanced: give back the stashes this call just made.
+.DESCRIPTION
+Only ever called on an abort path, before the pull has changed anything, so a
+blind pop is safe: these are the newest stashes, this function pushed them, and
+the tree underneath them is the one they came off.
+.COMPONENT
+git
+#>
+         if ($n -lt 1) { return }
+         foreach ($i in 1..$n) {
+             git stash pop
+             if ($LASTEXITCODE -ne 0) {
+                 Write-Host "stash pop failed - your changes are still in stash@{0}"
+                 return
+             }
+         }
      }
  try { 
      $oldrend= $PSStyle.OutputRendering 
@@ -1870,45 +1930,72 @@ git
  
  
      $commit_hash=$(git rev-parse HEAD)
-     $stashsave = git stash save
-     $stashed = -not ($stashsave -match 'No local changes to save')
+     # Tracked changes and blocking untracked files go into separate stashes and come
+     # back by different routes, so track them separately. Each is recorded only when
+     # a push actually made one -- `git stash` is a no-op on a clean tree and prints
+     # "No local changes to save"; treating that as a stash makes the restore operate
+     # on somebody else's stash@{0}.
+     $mainStashed = $false
+     $blockerFiles = @()
+     $stashsave = git stash push
+     if (-not ($stashsave -match 'No local changes to save')) { $mainStashed = $true }
      $outcheckout=""
      $outpull=""
+     $pullfailed = $false
      git fetch
      if ($checkout)
      {
          $outcheckout=git checkout $branch 2>&1
+         $pullfailed = $LASTEXITCODE -ne 0
          echo $outcheckout
      }else {
          $outpull = DoPull 2>&1
+         $pullfailed = $LASTEXITCODE -ne 0
          echo $outpull
      }
      $outmerge = @($outcheckout) + @($outpull)
      if ($outmerge | where { $_ -like "*The following untracked working tree files would be overwritten*" }) {
-         $y= $outmerge | where { $_  -like "`t*" }  | %{ $($_ | Out-string) -replace "`t","" } | %{ $_ -replace "`r`n","" } | %{ $_ -replace "`n","" }
-         echo "adding to stash $y"
-         if ($stashed) { git stash pop }
-         $y | %{ git add $_ }
-         git stash  | Out-Null
-         $stashed = $true
+         # @() matters: a single blocking file comes back as a scalar string, and
+         # splatting a string passes its *characters* as separate arguments.
+         $y = @(UntrackedBlockers $outmerge)
+         if (-not $y)
+         {
+             Write-Host "could not parse the blocking filenames out of git's output; aborting"
+             PopOurStashes ([int]$mainStashed)
+             return
+         }
+         echo "stashing blocking untracked files: $y"
+         # Stash *only* the blocking files. The tracked changes are already in the
+         # stash above, so there is nothing to pop and re-add here -- and a
+         # path-limited push leaves unrelated staged work where it was.
+         $s2 = git stash push -u -m "GitPullAdvanced blockers" -- @y
+         if ($LASTEXITCODE -ne 0)
+         {
+             Write-Host "could not stash the blocking files; aborting"
+             PopOurStashes ([int]$mainStashed)
+             return
+         }
+         if (-not ($s2 -match 'No local changes to save')) { $blockerFiles = $y }
          if ($checkout)
          {
              $outcheckout = git checkout $branch 2>&1
+             $pullfailed = $LASTEXITCODE -ne 0
              echo $outcheckout
          }
          else
          {
              $outpull = DoPull 2>&1
+             $pullfailed = $LASTEXITCODE -ne 0
              echo $outpull
          }
      }
-     if (-not $?)
+     if ($pullfailed)
      {
          Write-Host "unsucessful $LASTEXITCODE" #for now
          $conflicts = $(git diff --name-only --diff-filter=U  )
          if ((-not $conflicts))
          {
-             $z= askyn "countinue" 
+             $z= askyn "countinue"
              if (-not $z){return}
          }
      }
@@ -1921,29 +2008,85 @@ git
              Write-Host "wtf "
                  return
          }
-         Write-Host "There are merge conflicts. Please run git pull. Aborting"
+         Write-Host "There are merge conflicts."
      $userInput = Read-Host -Prompt @"
 Do you want to resolve  conflict using ours/theirs/no? 
 no just cancels (type exactly)
 "@ 
  
          if ($userInput -eq "no" ){
-             return 
+             return
          }
+         if ($userInput -notin @("ours","theirs")) {
+             Write-Host "unrecognised answer '$userInput'; aborting"
+             return
+         }
+         # Here "ours" means the local work survives and "theirs" means the pulled
+         # work survives. DoPull always rebases, and a rebase replays your commits
+         # *onto* upstream, so git's -X sides are swapped (git-rebase(1): "ours" is
+         # the so-far rebased series starting with <upstream>, "theirs" is the
+         # working branch). Hence the answer is translated, not passed through.
+         $strategy = if ($userInput -eq "theirs") { "ours" } else { "theirs" }
          git rebase --abort
-         DoPull @("-X","$userInput")
+         DoPull @("-X","$strategy")
          if (-not $?){Write-Host "unsucessful pull";return}
      }
  
-     # Checkout files from the stash - only the paths the stash actually touched,
-     # otherwise every freshly pulled file gets reverted to the pre-pull tree.
-     if (-not $stashed) { return }
-     $stashfiles = @(git stash show --include-untracked --name-only 'stash@{0}')
-     if (-not $stashfiles) { return }
-     git checkout stash -- @stashfiles | Out-Null
-     git reset | Out-Null
-     $localch= $(git diff --name-only)
-     $int = $localch | ?{ $changes -contains $_  } 
+     # Reapply the stashes we made. `git stash apply` merges the stashed *diff* onto
+     # the new HEAD, so freshly pulled files are left alone -- it does not check out
+     # a tree. Restoring path-by-path with `git checkout <stash> -- <paths>` cannot
+     # do this job at all: a staged deletion is absent from the stash tree, so the
+     # pathspec does not match and git aborts the whole checkout, silently dropping
+     # every other path with it.
+     # --index also reinstates what was staged, so no separate index bookkeeping.
+     # Ours are the newest, at stash@{0}..stash@{$stashCount-1}; nothing is dropped
+     # before this, so those indices do not shift underfoot.
+     $stashCount = [int]$mainStashed + $(if ($blockerFiles) { 1 } else { 0 })
+     if ($stashCount -eq 0) { return }
+     # Newest first, and nothing is dropped before this, so the indices are fixed:
+     # the blockers stash (if any) is stash@{0} and the main stash is behind it.
+     $blockerRef = if ($blockerFiles) { 'stash@{0}' } else { $null }
+     $mainRef    = if ($mainStashed)  { "stash@{$($stashCount-1)}" } else { $null }
+
+     if ($mainRef)
+     {
+         git stash apply --index $mainRef
+         if ($LASTEXITCODE -ne 0)
+         {
+             # --index is refused when the index cannot be reinstated (a conflict, or
+             # a path the pull now also touches). The changes still matter more than
+             # their staged/unstaged split, so retry without it.
+             Write-Host "could not restore the index for $mainRef; reapplying it flat"
+             git stash apply $mainRef
+             if ($LASTEXITCODE -ne 0)
+             {
+                 Write-Host "could not reapply $mainRef - it is still in the stash list, nothing was dropped"
+                 return
+             }
+         }
+         if (git diff --name-only --diff-filter=U)
+         {
+             Write-Host "reapplying the stash left conflicts; resolve them, then 'git stash drop' when happy"
+             return
+         }
+     }
+     if ($blockerRef)
+     {
+         # These were untracked when we stashed them, and the pull has since created
+         # the same paths as tracked files -- which is why it refused in the first
+         # place. `git stash apply` will not touch them ("already exists, no
+         # checkout"), so take them from the stash's third parent, where untracked
+         # entries live, overwriting the pulled copy. `git reset` then leaves them as
+         # plain unstaged local modifications, which is how they arrived.
+         git checkout "$blockerRef^3" -- @blockerFiles | Out-Null
+         git reset -- @blockerFiles | Out-Null
+     }
+     # --name-only alone lists only unstaged changes; --index means some of what we
+     # just restored is staged, and those files have to be considered here too.
+     $localch= $(git diff --name-only HEAD)
+     # @() around the whole pipeline: a one-element result would otherwise come back
+     # as a scalar string, and splatting a string passes its characters as arguments.
+     $int = @($localch | ?{ $changes -contains $_  })
      if ($int)
      {
          Write-Host "Following files are different in local branch: $int " 
@@ -1962,9 +2105,12 @@ no just cancels (type exactly)
                          Write-Host "git checkout $branch @int "
                          git checkout $branch -- @int 
                      }
-                     else 
+                     else
                      {
-                         git checkout -- @int
+                         # HEAD, not a bare `--`: the reapply above staged some of
+                         # these, and `git checkout -- <path>` only resets the
+                         # worktree, leaving the local version staged in the index.
+                         git checkout HEAD -- @int
                      }
              } 
              if ($userInput -eq "apply")
@@ -1974,9 +2120,10 @@ no just cancels (type exactly)
          }
      }
  
-     if ($dontkeepstash) 
+     if ($dontkeepstash)
      {
-         git stash drop
+         # Drop only the ones we made; each drop shifts the rest down to stash@{0}.
+         foreach ($i in 1..$stashCount) { git stash drop | Out-Null }
      }
  }
  finally 
