@@ -2011,6 +2011,7 @@ git
          Write-Host "There are merge conflicts."
      $userInput = Read-Host -Prompt @"
 Do you want to resolve  conflict using ours/theirs/no? 
+Here "ours" means the local work survives
 no just cancels (type exactly)
 "@ 
  
@@ -2032,6 +2033,19 @@ no just cancels (type exactly)
          if (-not $?){Write-Host "unsucessful pull";return}
      }
  
+     # The stashes only go back onto a tree git has finished with. Unmerged paths
+     # here mean the pull/rebase is still mid-conflict; applying a stash on top of
+     # that cannot work ("error: could not write index") and only muddles the output.
+     $pending = $(git diff --name-only --diff-filter=U)
+     if ($pending)
+     {
+         Write-Host "the pull left unresolved conflicts; resolve them first."
+         Write-Host "nothing was reapplied and nothing was dropped - your changes are still in the stash list."
+         Write-Host "conflicted files:"
+         $pending | %{ Write-Host "  $_" }
+         return
+     }
+
      # Reapply the stashes we made. `git stash apply` merges the stashed *diff* onto
      # the new HEAD, so freshly pulled files are left alone -- it does not check out
      # a tree. Restoring path-by-path with `git checkout <stash> -- <paths>` cannot
@@ -2053,6 +2067,18 @@ no just cancels (type exactly)
          git stash apply --index $mainRef
          if ($LASTEXITCODE -ne 0)
          {
+             # A failed --index apply can still have left conflicts in the tree.
+             # Retrying flat on top of unmerged paths only fails again with
+             # "error: could not write index", so stop instead of retrying.
+             $unmerged = $(git diff --name-only --diff-filter=U)
+             if ($unmerged)
+             {
+                 Write-Host "reapplying $mainRef produced merge conflicts - resolve them manually."
+                 Write-Host "the stash was NOT dropped; it is still at $mainRef. 'git stash drop' when happy."
+                 Write-Host "conflicted files:"
+                 $unmerged | %{ Write-Host "  $_" }
+                 return
+             }
              # --index is refused when the index cannot be reinstated (a conflict, or
              # a path the pull now also touches). The changes still matter more than
              # their staged/unstaged split, so retry without it.
@@ -2850,9 +2876,9 @@ function SetExtendedDisplayPort()
 .SYNOPSIS
 Sets extended display mode and makes one of the DisplayPort monitors the primary display.
 .DESCRIPTION
-Finds all DisplayPort-connected monitors via Get-DisplayInfo, enables them as extended displays, and sets the one at PrimaryIndex (1-based) as the primary display.
+Finds all external monitors via Get-DisplayInfo (DisplayPort ones are preferred when present, otherwise HDMI/other external connections), enables them as extended displays, and sets the one at PrimaryIndex (1-based) as the primary display.
 .PARAMETER PrimaryIndex
-1-based index of the DisplayPort monitor to make primary. Defaults to 1.
+1-based index of the external monitor to make primary. Defaults to 1.
 .COMPONENT
 windows
 #>
@@ -2860,9 +2886,11 @@ windows
         [ValidateRange(1, 99)]
         [int]$PrimaryIndex = 1
     )
-    $dpDisplays = @(Get-DisplayInfo | Where-Object { $_.ConnectionType -eq 'DisplayPort' })
+    $external = @(Get-DisplayInfo | Where-Object { $_.ConnectionType -ne 'Internal' })
+    $dpDisplays = @($external | Where-Object { $_.ConnectionType -eq 'DisplayPort' })
+    if (-not $dpDisplays) { $dpDisplays = $external }
     if (-not $dpDisplays) {
-        Write-Warning "No DisplayPort monitor found."
+        Write-Warning "No external monitor found."
         return
     }
     $dpIds = @($dpDisplays | ForEach-Object { $_.DisplayId })
@@ -2871,12 +2899,12 @@ windows
     # Enable as extended (not cloned)
     Enable-Display -DisplayId $dpIds
     if ($PrimaryIndex -gt $dpIds.Count) {
-        Write-Warning "PrimaryIndex $PrimaryIndex out of range ($($dpIds.Count) DisplayPort monitor(s) found); falling back to 1."
+        Write-Warning "PrimaryIndex $PrimaryIndex out of range ($($dpIds.Count) external monitor(s) found); falling back to 1."
         $PrimaryIndex = 1
     }
     $idx = $PrimaryIndex - 1
     Set-DisplayPrimary -DisplayId $dpIds[$idx]
-    Write-Host "DisplayPort monitor '$($dpDisplays[$idx].DisplayName)' (ID $($dpIds[$idx])) set as extended primary display." -ForegroundColor Green
+    Write-Host "External monitor '$($dpDisplays[$idx].DisplayName)' ($($dpDisplays[$idx].ConnectionType), ID $($dpIds[$idx])) set as extended primary display." -ForegroundColor Green
 }
 function RunWTAdmin()
 {
@@ -4441,3 +4469,106 @@ windows
 
     Start-Process chrome.exe "http://127.0.0.1:$Port/devtools/inspector.html?ws=$($t.webSocketDebuggerUrl -replace '^ws://','')"
 }
+
+function Get-FilePRs {
+<#
+.SYNOPSIS
+Finds Pull Requests (open, closed, or merged) that modify a specified file.
+.DESCRIPTION
+Uses GitHub CLI's search API (gh search prs) scoped to the current repository.
+Executes in a single fast query.
+.PARAMETER FilePath
+The file path (relative to repo root or absolute) to check.
+.PARAMETER State
+State of PRs to query: 'all' (default), 'open', 'closed', or 'merged'.
+.PARAMETER Limit
+Maximum number of PRs to return. Default is 50.
+.EXAMPLE
+Get-FilePRs "README.md"
+.EXAMPLE
+Get-FilePRs "docs/fei_latest_state.md" -State open
+.COMPONENT
+git
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [string]$FilePath,
+
+        [Parameter()]
+        [ValidateSet('all', 'open', 'closed', 'merged')]
+        [string]$State = 'all',
+
+        [Parameter()]
+        [int]$Limit = 50
+    )
+
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        Write-Error "GitHub CLI (gh) is not installed or not in PATH."
+        return
+    }
+
+    # Verify inside git repo
+    $gitRoot = git rev-parse --show-toplevel 2>$null
+    if (-not $gitRoot) {
+        Write-Error "Current directory is not inside a git repository."
+        return
+    }
+
+    # Resolve repo slug (e.g. owner/repo) from origin remote
+    $remoteUrl = git remote get-url origin 2>$null
+    if ($remoteUrl -match 'github\.com[:/](?<owner>[^/]+)/(?<repo>[^/\.]+)') {
+        $repoSlug = "$($Matches['owner'])/$($Matches['repo'])"
+    } else {
+        Write-Error "Could not determine GitHub repository from 'origin' remote."
+        return
+    }
+
+    # If full path given, make relative to git root
+    $targetPath = $FilePath
+    if ([System.IO.Path]::IsPathRooted($FilePath)) {
+        $fullGit = [System.IO.Path]::GetFullPath($gitRoot).TrimEnd('\', '/')
+        $fullFile = [System.IO.Path]::GetFullPath($FilePath)
+        if ($fullFile.StartsWith($fullGit, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $targetPath = $fullFile.Substring($fullGit.Length).TrimStart('\', '/')
+        }
+    }
+    $targetPath = $targetPath.Replace('\', '/')
+
+    # Build search arguments
+    $searchArgs = @('search', 'prs', "--repo", $repoSlug, "`"$targetPath`"", "--limit", $Limit, "--json", "number,title,state,url")
+    if ($State -ne 'all') {
+        $searchArgs += @('--state', $State)
+    }
+
+    Write-Host "Searching PRs in $repoSlug touching '$targetPath' (state: $State)..." -ForegroundColor Cyan
+
+    $raw = & gh @searchArgs 2>$null
+    if (-not $raw) {
+        Write-Host "No PRs found touching '$targetPath'." -ForegroundColor Yellow
+        return
+    }
+
+    $candidates = $raw | ConvertFrom-Json
+    if (-not $candidates -or $candidates.Count -eq 0) {
+        Write-Host "No PRs found touching '$targetPath'." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "Verifying $($candidates.Count) candidate PR(s)..." -ForegroundColor Cyan
+    $verified = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+    foreach ($pr in $candidates) {
+        $diffFiles = gh pr diff $pr.number --name-only 2>$null
+        if ($diffFiles -contains $targetPath) {
+            $verified.Add($pr)
+        }
+    }
+
+    if ($verified.Count -eq 0) {
+        Write-Host "No PRs actually modify '$targetPath' (candidates mentioned the name but didn't change the file)." -ForegroundColor Yellow
+    } else {
+        $verified | Sort-Object number -Descending | Format-Table -Property number, state, title, url -AutoSize
+    }
+}
+
